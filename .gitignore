@@ -1,214 +1,43 @@
-# 忽略敏感配置
-core_config.txt
-test.py
-mcp_server/servers.json
-tests/api_keys.json
-tests/test_inputs/
-
-# scripts/check_i18n.py 偶尔会被人 redirect 到这里，别再次入库
-/i18n_check_output.txt
-
-# 忽略日志文件
-*.log
-/logs/
-/data/
-debug_audio/*
-# Binaries (but keep our committed Windows tools listed explicitly if needed)
-*.exe
-*.dll
-*.pdb
-*.lib
-*.obj
-*.o
-*.a
-*.lo
-*.loT
-*.stackdump
-
-# 忽略 memory/store 下所有内容（含子目录和文件）
-memory/store/*
-!memory/store/.gitkeep
-
-# 忽略缓存目录（根目录及 utils 下）
-/cache/
-utils/cache/
-config/api.py
-config/*.json
-!config/api_providers.json
-env/*
-lanlan_frd.exe
-
-# 忽略临时文件
-*.tmp
-*.bak
-
-# 忽略 Python 缓存文件和字节码
+# Python
 __pycache__/
 *.py[cod]
-
-# 忽略 Jupyter Notebook 检查点
-.ipynb_checkpoints/
-.vscode/
-.idea/
-.cursor/
-.pytest_cache/
-.DS_Store
-.codex
-.venv
-.venv_monitor/
-.matplotlib/
-.pyinstaller-config/
-.hypothesis/
-.agent-logs/
-.kiro/
-# Local Windows Nuitka build script — maintainer-only, not for repo
-build_nuitka.bat
-# Playwright browsers cache (used by build_nuitka.bat, not for repo)
-playwright_browsers/
-.playwright-browsers/
-.playwright-cli/
-# Local embedding model cache (downloaded by scripts/prepare_embedding_model.py)
-data/embedding_models/
-.env
-.env.local
-.env.development.local
-.env.test.local
-.env.production.local
-.ruff_cache
-*.code-workspace
-.claude
-.trae/
-plans/
-CLAUDE.md
-/.workbuddy/
-
-# Rust: ignore target and cargo artifacts
-/launcher/target/
-**/target/
-Cargo.lock
-
-# Ignore embedded Rust subprojects (not part of current PR)
-/rust/neko-message-plane/
-
-# Node/Front-end temp (if any)
-node_modules/
-*.cache/
-*.tsbuildinfo
-dist/
+*$py.class
+*.so
+.Python
 build/
-*.tsbuildinfo
-docs/.vitepress/cache/
-static/react/neko-chat/
-
-# Python venvs and wheels
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
 *.egg-info/
+.installed.cfg
 *.egg
-pip-wheel-metadata/
-site-packages/
-env/
+
+# Virtual Environment
 venv/
 ENV/
-env.bak/
+env/
 
-# OS miscellany
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
 Thumbs.db
-ehthumbs.db
-desktop.ini
 
-# 忽略静态资源
-static/ziraitikuwa/*
-static/neko/*
-static/kemomimi/*
-static/yui/*
-static/react/neko-chat/*
-打包说明.txt
-runtime_hook_inflect.py
-backup/
-build*
-!build_frontend.bat
-!build_frontend.sh
-!build-desktop*.yml
-metadata.package.json
-version_info.txt
-
-# 复原Steam
-!steamworks/steam_api64.dll
-!steamworks/steam_api64.lib
-!steamworks/SteamworksPy64.dll
-
-start_servers.bat
-start.sh
-
-# --- CosyVoice Ignore Rules ---
-local_server/cosyvoice_server/*wav
-
-
-# 测试报告与结果
-tests/reports/
-
-# Testbench 运行时数据目录（沙盒/日志/存档/autosave/导出/用户自定义 schema 和 dialog template）
-# 代码目录 tests/testbench/ 仍入库, 数据目录 tests/testbench_data/ 全部忽略
-tests/testbench_data/
-latest_report.json
-sendText.js
-tmp/
-output/
-data/browser_use_prompts/*.md
-data/browser_use_extensions/
-.coverage
-.VSCodeCounter
-
-# Local galgame vision training data/checkpoints. Keep runtime ONNX and reports in git.
-plugin/plugins/galgame_plugin/training/data/train.jsonl
-plugin/plugins/galgame_plugin/training/data/val.jsonl
-plugin/plugins/galgame_plugin/training/data/raw/
-plugin/plugins/galgame_plugin/models/vision/screen_classifier/best.pth
-plugin/plugins/galgame_plugin/models/vision/screen_classifier/live_validation_v1.json
-plugin/plugins/galgame_plugin/models/vision/screen_classifier/phase1_coverage_v1.json
-
-# 插件服务器运行时生成的凭证文件
-plugin/.plugin_server_admin_code
-
-# 插件包解包后提取出的 profile 目录（运行/导入产物，不入库）
-plugin/.neko-package-profiles/
-
-# 插件备忘提醒运行时数据库
-plugin/plugins/memo_reminder/store.db
-
-# Local nested plugin repos (keep them out of the parent repo index)
-plugin/neko-plugin-docs/
-plugin/rust/
-
-# 本地调试/测试用插件
-plugin/plugins/music_tester/
-plugin/plugins/web_radio/
-
-# QQ 自动回复：NapCat.Shell 整个目录不入库，仅保留 .gitkeep 占位
-plugin/plugins/qq_auto_reply/NapCat.Shell/*
-
-# QQ 自动回复 测试数据
-plugin/plugins/qq_auto_reply/static/cache/
-plugin/plugins/qq_auto_reply/data/
-
-# bilibili_danmaku 插件运行时数据（凭据、用户画像），不入库
-plugin/plugins/bilibili_danmaku/data/bili_credential.*
-plugin/plugins/bilibili_danmaku/data/user_profiles/
-!plugin/plugins/qq_auto_reply/NapCat.Shell/.gitkeep
-# Ignore local temporary Steam/launcher environment dumps
-.tmp_env_*
-.test_neko_write
-
-# Jukebox 二进制资源（音乐、动画），只保留 songs.json 索引
-static/jukebox/*.mp3
-static/jukebox/*.wav
-static/jukebox/*.ogg
-static/jukebox/*.flac
-static/jukebox/*.vmd
-static/jukebox/*.vrma
-static/jukebox/*.bvh
-static/jukebox/*.fbx
-tests/prompt_dump.json
-tests/testbench/docs/dev_note.txt
-
-# yui-origin Live2D 模型源码打包在 assets/yui-origin.tar.gz；build_frontend 解压到此
-/static/yui-origin/
+# N.E.K.O Plugin specific
+*.log
+data/
+logs/
+.cache/
