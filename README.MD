@@ -47,3 +47,11 @@ git push origin v0.1.0
 ```toml
 entry = "plugins.claude_code_adapter:ClaudeCodeAdapterPlugin"
 ```
+
+## 版本历史
+
+### v0.1.0 (2026-07-27)
+- 初始版本发布
+- 通过 @llm_tool 将 Claude Code CLI 注册为猫娘可调用的工具集
+- 支持执行项目开发任务：写代码、改 bug、跑测试、查文档
+- 支持会话恢复、技能注入、流式输出解析和错误自动恢复
