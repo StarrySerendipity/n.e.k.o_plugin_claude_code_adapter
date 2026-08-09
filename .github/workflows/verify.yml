@@ -28,4 +28,4 @@ jobs:
     
     - name: Run smoke tests
       run: |
-        uv run pytest tests/test_smoke.py -v
+        uv run pytest tests/test_smoke.py -v --import-mode=importlib
