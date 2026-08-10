@@ -16,8 +16,7 @@
 - unknown: 未分类错误
 """
 
-from __future__ import annotations
-
+import re
 import re
 from dataclasses import dataclass
 from typing import Any

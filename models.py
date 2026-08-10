@@ -5,8 +5,6 @@
 方便单元测试和未来扩展。
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
