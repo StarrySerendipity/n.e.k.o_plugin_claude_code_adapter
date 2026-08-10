@@ -1,5 +1,7 @@
 # Python
 __pycache__/
+.pytest_cache/
+store.db
 *.py[cod]
 *$py.class
 *.so
@@ -26,7 +28,6 @@ ENV/
 env/
 
 # IDE
-.vscode/
 .idea/
 *.swp
 *.swo
