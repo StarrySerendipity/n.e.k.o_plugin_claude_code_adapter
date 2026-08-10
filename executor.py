@@ -22,13 +22,12 @@ from typing import Any, Optional
 
 from .errors import (
     CLI_NOT_FOUND,
-    ClassifiedError,
     TIMEOUT,
+    ClassifiedError,
     classify_error,
 )
 from .models import AdapterConfig, CLIInvocation
 from .parser import ClaudeOutputParser, ParsedStream
-
 
 # ---------------------------------------------------------------------------
 # 跨平台 CLI 检测

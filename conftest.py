@@ -1,7 +1,6 @@
 """Root conftest — mock N.E.K.O SDK and prevent root __init__.py collection."""
 
 import sys
-from pathlib import Path
 from unittest.mock import MagicMock
 
 # Prevent pytest from collecting root Python files as test modules

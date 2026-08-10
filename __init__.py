@@ -31,17 +31,16 @@ _IN_TEST = "pytest" in sys.modules
 
 if not _IN_TEST:
     from plugin.sdk.plugin import (
+        Err,
         NekoPluginBase,
-        neko_plugin,
-        plugin_entry,
+        Ok,
+        SdkError,
         lifecycle,
         llm_tool,
-        Ok,
-        Err,
-        SdkError,
+        neko_plugin,
+        plugin_entry,
     )
 
-    from .models import AdapterConfig, ExecuteResult
     from .errors import (
         ClassifiedError,
         is_retryable,
@@ -51,6 +50,7 @@ if not _IN_TEST:
         build_cli_invocation,
         detect_claude_cli,
     )
+    from .models import AdapterConfig, ExecuteResult
     from .parser import ClaudeOutputParser
     from .session import SessionManager, compute_prompt_signature
 

@@ -17,10 +17,8 @@
 """
 
 import re
-import re
 from dataclasses import dataclass
 from typing import Any
-
 
 # 错误分类常量
 AUTH_REQUIRED = "auth_required"
