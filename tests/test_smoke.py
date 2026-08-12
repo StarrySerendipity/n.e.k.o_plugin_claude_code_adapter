@@ -15,7 +15,7 @@ def test_plugin_toml_valid():
     """测试 plugin.toml 内容有效。"""
     plugin_toml = Path(__file__).parent.parent / "plugin.toml"
     content = plugin_toml.read_text(encoding="utf-8")
-    
+
     assert "[plugin]" in content, "必须包含 [plugin] 段"
     assert 'id = "claude_code_adapter"' in content, "插件 ID 必须正确"
     assert "entry" in content, "必须包含 entry 字段"
@@ -24,6 +24,7 @@ def test_plugin_toml_valid():
 def test_models_importable():
     """测试 models 模块可以独立导入（无相对导入依赖）。"""
     import importlib.util
+
     root = Path(__file__).parent.parent
     spec = importlib.util.spec_from_file_location("models", root / "models.py")
     assert spec is not None, "models.py should be loadable"
@@ -39,6 +40,7 @@ def test_models_importable():
 def test_errors_importable():
     """测试 errors 模块可以独立导入（无相对导入依赖）。"""
     import importlib.util
+
     root = Path(__file__).parent.parent
     spec = importlib.util.spec_from_file_location("errors", root / "errors.py")
     assert spec is not None, "errors.py should be loadable"
@@ -55,9 +57,9 @@ def test_parser_importable():
     import sys
     import types
     from pathlib import Path
-    
+
     root = Path(__file__).parent.parent
-    
+
     # 创建一个虚拟包来支持相对导入
     pkg_name = "_test_claude_code_adapter"
     if pkg_name not in sys.modules:
@@ -65,7 +67,7 @@ def test_parser_importable():
         pkg.__path__ = [str(root)]
         pkg.__package__ = pkg_name
         sys.modules[pkg_name] = pkg
-        
+
         # 先加载 models（parser 依赖它）
         models_spec = importlib.util.spec_from_file_location(
             f"{pkg_name}.models", root / "models.py"
@@ -74,7 +76,7 @@ def test_parser_importable():
         models_mod.__package__ = pkg_name
         sys.modules[f"{pkg_name}.models"] = models_mod
         models_spec.loader.exec_module(models_mod)
-    
+
     # 加载 parser
     parser_spec = importlib.util.spec_from_file_location(
         f"{pkg_name}.parser", root / "parser.py"
@@ -83,7 +85,7 @@ def test_parser_importable():
     parser_mod.__package__ = pkg_name
     sys.modules[f"{pkg_name}.parser"] = parser_mod
     parser_spec.loader.exec_module(parser_mod)
-    
+
     # 验证类存在
     assert hasattr(parser_mod, "ClaudeOutputParser")
     assert hasattr(parser_mod, "ParsedStream")
@@ -95,9 +97,9 @@ def test_session_importable():
     import sys
     import types
     from pathlib import Path
-    
+
     root = Path(__file__).parent.parent
-    
+
     # 创建一个虚拟包来支持相对导入
     pkg_name = "_test_claude_code_adapter"
     if pkg_name not in sys.modules:
@@ -105,7 +107,7 @@ def test_session_importable():
         pkg.__path__ = [str(root)]
         pkg.__package__ = pkg_name
         sys.modules[pkg_name] = pkg
-        
+
         # 先加载 models
         models_spec = importlib.util.spec_from_file_location(
             f"{pkg_name}.models", root / "models.py"
@@ -114,7 +116,7 @@ def test_session_importable():
         models_mod.__package__ = pkg_name
         sys.modules[f"{pkg_name}.models"] = models_mod
         models_spec.loader.exec_module(models_mod)
-    
+
     # 加载 session
     session_spec = importlib.util.spec_from_file_location(
         f"{pkg_name}.session", root / "session.py"
@@ -123,7 +125,7 @@ def test_session_importable():
     session_mod.__package__ = pkg_name
     sys.modules[f"{pkg_name}.session"] = session_mod
     session_spec.loader.exec_module(session_mod)
-    
+
     # 验证函数存在
     assert hasattr(session_mod, "compute_prompt_signature")
     assert hasattr(session_mod, "SessionManager")

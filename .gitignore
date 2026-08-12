@@ -39,6 +39,7 @@ Thumbs.db
 
 # N.E.K.O Plugin specific
 *.log
+*.neko-plugin
 data/
 logs/
 .cache/
