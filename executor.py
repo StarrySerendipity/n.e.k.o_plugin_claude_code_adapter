@@ -222,6 +222,17 @@ def kill_process_tree(proc: asyncio.subprocess.Process, logger: Any = None) -> N
 # 子进程执行器
 # ---------------------------------------------------------------------------
 
+# StreamReader 单行上限。stream-json 的单行可以非常大（长 assistant 文本、
+# 工具输出、base64 图片），asyncio 默认 limit 仅 64KB：一旦超限 readline
+# 抛 ValueError，读取协程直接死亡，管道缓冲写满后 CLI 会永久卡死在输出上
+# ——表现为任务偶发“中断”但状态永远停在 running。长任务必须调大。
+_PIPE_LINE_LIMIT = 32 * 1024 * 1024
+
+# 进程退出后等待 stdout/stderr 读取协程收尾的时限。若 Claude 派生的子孙
+# 进程继承了管道写端句柄（如后台 dev server），readline 会永远阻塞，
+# 导致任务状态永远停在 running；超时后强制取消读取协程继续收尾。
+_DRAIN_TIMEOUT = 15.0
+
 
 class ClaudeCLIExecutor:
     """Claude CLI 子进程执行器。
@@ -291,6 +302,7 @@ class ClaudeCLIExecutor:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                limit=_PIPE_LINE_LIMIT,
             )
         except FileNotFoundError as e:
             return parser.finalize(), ClassifiedError(
@@ -308,7 +320,22 @@ class ClaudeCLIExecutor:
             if proc.stderr is None:
                 return
             while True:
-                line = await proc.stderr.readline()
+                try:
+                    line = await proc.stderr.readline()
+                except ValueError:
+                    # 单行超过 limit：丢弃超限部分，继续读后续数据
+                    # （流位置已消费到 limit 处，后续从下一个换行处恢复）
+                    if self.logger is not None:
+                        try:
+                            self.logger.warning(
+                                "stderr line exceeded {}B limit, truncated",
+                                _PIPE_LINE_LIMIT,
+                            )
+                        except Exception:
+                            pass
+                    continue
+                except Exception:
+                    break
                 if not line:
                     break
                 stderr_lines.append(
@@ -320,7 +347,22 @@ class ClaudeCLIExecutor:
             if proc.stdout is None:
                 return
             while True:
-                line = await proc.stdout.readline()
+                try:
+                    line = await proc.stdout.readline()
+                except ValueError:
+                    # 单行超过 limit：丢弃超限部分继续读，避免读取协程死亡
+                    # 导致管道写满、CLI 永久卡死（长任务偶发中断的根因之一）
+                    if self.logger is not None:
+                        try:
+                            self.logger.warning(
+                                "stdout line exceeded {}B limit, truncated",
+                                _PIPE_LINE_LIMIT,
+                            )
+                        except Exception:
+                            pass
+                    continue
+                except Exception:
+                    break
                 if not line:
                     break
                 try:
@@ -393,8 +435,8 @@ class ClaudeCLIExecutor:
                 await proc.wait()
             except Exception:
                 pass
-            # 等待读取任务结束
-            await _drain_tasks(stdout_task, stderr_task)
+            # 等待读取任务结束（限时，防止孤儿子进程持有管道句柄导致永久阻塞）
+            await _drain_tasks(stdout_task, stderr_task, logger=self.logger)
             stderr_text = "\n".join(stderr_lines)
             return parser.finalize(), ClassifiedError(
                 kind=TIMEOUT,
@@ -402,8 +444,9 @@ class ClaudeCLIExecutor:
                 retryable=False,
             )
 
-        # 等待读取任务完成
-        await _drain_tasks(stdout_task, stderr_task)
+        # 等待读取任务完成（限时：进程已退出，但若子孙进程继承了管道
+        # 写端句柄，readline 会永远阻塞，任务将永远停在 running）
+        await _drain_tasks(stdout_task, stderr_task, logger=self.logger)
 
         stream = parser.finalize()
 
@@ -438,13 +481,45 @@ class ClaudeCLIExecutor:
         return stream, None
 
 
-async def _drain_tasks(*tasks: asyncio.Task) -> None:
-    """等待所有任务结束，忽略异常。"""
+async def _drain_tasks(
+    *tasks: asyncio.Task,
+    timeout: float = _DRAIN_TIMEOUT,
+    logger: Any = None,
+) -> None:
+    """限时等待所有读取任务结束；超时则强制取消并继续。
+
+    进程退出后，若 Claude 派生的子孙进程（如后台服务）继承了
+    stdout/stderr 管道写端句柄，管道不会 EOF，readline 会永远阻塞，
+    任务状态将永远停在 running。因此必须限时等待：超时后取消读取
+    任务并继续收尾（此时 CLI 已退出，未读尽的只是尾部残余输出）。
+    """
+    pending = [t for t in tasks if not t.done()]
+    if pending:
+        _, not_done = await asyncio.wait(set(pending), timeout=timeout)
+        for task in not_done:
+            task.cancel()
+        for task in not_done:
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+        if not_done and logger is not None:
+            try:
+                logger.warning(
+                    "stdout/stderr drain timed out after {}s; {} reader task(s) cancelled "
+                    "(likely orphaned child processes still holding pipe handles)",
+                    timeout,
+                    len(not_done),
+                )
+            except Exception:
+                pass
+    # 已完成的任务也要 await 一次，消费其异常避免“exception never retrieved”
     for task in tasks:
-        try:
-            await task
-        except Exception:
-            pass
+        if task.done():
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
 
 
 __all__ = [

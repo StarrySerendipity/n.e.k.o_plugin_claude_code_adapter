@@ -18,10 +18,15 @@ import type { PluginSurfaceProps } from "@neko/plugin-ui"
 // ==========================================================================
 // Claude Code Adapter — 会话管理面板
 //
-// 界面照搬 cc-switch（farion1231/cc-switch）的「会话管理」页：
-// - 左侧：会话列表（标题 + 时间 + 项目目录）
-// - 右侧：会话详情（UUID、时间、用户/AI 消息气泡、删除会话按钮）
+// 界面参考 cc-switch（farion1231/cc-switch）的「会话管理」页：
+// - 左侧：会话列表（标题 + 相对时间 + 项目目录 + 搜索过滤）
+// - 右侧：会话详情（UUID、时间、用户/AI/工具消息、长消息折叠、删除会话）
 // 数据来源：~/.claude/projects 下的 Claude 原生会话存档（*.jsonl）
+//
+// 注意：api.call 返回的是宿主包装的 envelope
+//   { plugin_id, action_id, result: <插件 entry 返回值> }
+// 必须先经 unwrapActionResult 解包再读字段（与 neko_live / neko_warthunder
+// 等内置插件一致），否则 result.sessions 永远是 undefined → 面板 0 会话。
 // ==========================================================================
 
 type SessionMeta = {
@@ -54,12 +59,36 @@ type PluginState = {
   cli_available?: boolean
 }
 
+function unwrapActionResult(envelope: any): Record<string, any> {
+  if (envelope && typeof envelope === "object") {
+    if (envelope.result && typeof envelope.result === "object") return envelope.result
+    return envelope
+  }
+  return {}
+}
+
 function formatTime(ts: number | null | undefined): string {
   if (!ts) return ""
   const d = new Date(ts)
   if (isNaN(d.getTime())) return ""
   const pad = (n: number) => String(n).padStart(2, "0")
   return `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+}
+
+// 相对时间（照 cc-switch SessionItem 的 formatRelativeTime）
+function formatRelativeTime(ts: number | null | undefined): string {
+  if (!ts) return ""
+  const d = new Date(ts)
+  if (isNaN(d.getTime())) return ""
+  const diff = Date.now() - d.getTime()
+  const minutes = Math.floor(diff / 60000)
+  const hours = Math.floor(diff / 3600000)
+  const days = Math.floor(diff / 86400000)
+  if (minutes < 1) return "刚刚"
+  if (minutes < 60) return `${minutes} 分钟前`
+  if (hours < 24) return `${hours} 小时前`
+  if (days < 7) return `${days} 天前`
+  return `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()}`
 }
 
 function projectName(dir: string | undefined): string {
@@ -83,6 +112,25 @@ const styles = {
     background: "#f9fafb",
     overflowY: "auto",
     maxHeight: "640px",
+  },
+  searchBox: {
+    padding: "8px 10px",
+    borderBottom: "1px solid #eef0f3",
+    position: "sticky" as const,
+    top: 0,
+    background: "#f9fafb",
+    zIndex: 1,
+  },
+  searchInput: {
+    width: "100%",
+    boxSizing: "border-box" as const,
+    padding: "6px 10px",
+    fontSize: "12px",
+    border: "1px solid #d1d5db",
+    borderRadius: "6px",
+    background: "#ffffff",
+    color: "#1f2937",
+    outline: "none",
   },
   sidebarItem: {
     padding: "10px 12px",
@@ -185,6 +233,14 @@ const styles = {
     fontSize: "13px",
     cursor: "pointer",
   },
+  expandButton: {
+    background: "transparent",
+    border: "none",
+    color: "#2563eb",
+    fontSize: "12px",
+    cursor: "pointer",
+    padding: "4px 0 0 0",
+  },
 }
 
 function roleAppearance(role: string): { label: string; tagBg: string; tagFg: string; bubbleBg: string; align: string } {
@@ -197,9 +253,17 @@ function roleAppearance(role: string): { label: string; tagBg: string; tagFg: st
   return { label: "工具", tagBg: "#f3f4f6", tagFg: "#6b7280", bubbleBg: "#f9fafb", align: "flex-start" }
 }
 
+// 长消息折叠阈值（照 cc-switch SessionMessageItem：>3000 字符折叠到 1500）
+const COLLAPSE_THRESHOLD = 3000
+const COLLAPSED_LENGTH = 1500
+
 function MessageBubble({ message }: { message: SessionMessage }) {
   const role = message.role || "unknown"
   const appearance = roleAppearance(role)
+  const [expanded, setExpanded] = useState(false)
+  const content = message.content || ""
+  const isLong = content.length > COLLAPSE_THRESHOLD
+  const displayContent = isLong && !expanded ? content.slice(0, COLLAPSED_LENGTH) + "…" : content
   return (
     <div style={{ ...styles.bubbleRow, justifyContent: appearance.align }}>
       <div style={{ maxWidth: "82%" }}>
@@ -212,7 +276,14 @@ function MessageBubble({ message }: { message: SessionMessage }) {
           </span>
         ) : null}
         <div style={{ ...styles.bubble, background: appearance.bubbleBg, border: "1px solid #e5e7eb", marginTop: "4px" }}>
-          {message.content || ""}
+          {displayContent}
+          {isLong ? (
+            <div>
+              <button type="button" style={styles.expandButton} onClick={() => setExpanded((v) => !v)}>
+                {expanded ? "收起" : `展开完整内容 (${Math.round(content.length / 1000)}k)`}
+              </button>
+            </div>
+          ) : null}
         </div>
       </div>
     </div>
@@ -228,6 +299,7 @@ export default function ClaudeCodeAdapterPanel(props: PluginSurfaceProps<PluginS
   const [sessions, setSessions] = useState<SessionMeta[]>([])
   const [loadingList, setLoadingList] = useState(false)
   const [listError, setListError] = useState("")
+  const [searchQuery, setSearchQuery] = useState("")
   const [selectedId, setSelectedId] = useState("")
   const [detail, setDetail] = useState<SessionDetail | null>(null)
   const [loadingDetail, setLoadingDetail] = useState(false)
@@ -238,7 +310,10 @@ export default function ClaudeCodeAdapterPanel(props: PluginSurfaceProps<PluginS
     setLoadingList(true)
     setListError("")
     try {
-      const result: any = await api.call("list_claude_sessions", { limit: 300 }, { timeoutMs: 60000 })
+      // api.call 返回宿主包装的 envelope，真实数据在 envelope.result 里，
+      // 必须先解包（否则 result.sessions 恒为 undefined，面板显示 0 会话）
+      const envelope = await api.call("list_claude_sessions", { limit: 300 }, { timeoutMs: 60000 })
+      const result: any = unwrapActionResult(envelope)
       const list = Array.isArray(result && result.sessions) ? result.sessions : []
       setSessions(list)
     } catch (error: any) {
@@ -253,8 +328,9 @@ export default function ClaudeCodeAdapterPanel(props: PluginSurfaceProps<PluginS
     setDetailError("")
     setDetail(null)
     try {
-      const result: any = await api.call("get_claude_session", { session_id: sessionId }, { timeoutMs: 60000 })
-      setDetail(result || null)
+      const envelope = await api.call("get_claude_session", { session_id: sessionId }, { timeoutMs: 60000 })
+      const result: any = unwrapActionResult(envelope)
+      setDetail(result && result.session_id ? result : null)
     } catch (error: any) {
       setDetailError(error && error.message ? error.message : String(error))
     } finally {
@@ -306,6 +382,17 @@ export default function ClaudeCodeAdapterPanel(props: PluginSurfaceProps<PluginS
     }
   }
 
+  // 搜索过滤：标题 / 项目目录 / 会话 ID（照 cc-switch useSessionSearch 的匹配面）
+  const query = searchQuery.trim().toLowerCase()
+  const filteredSessions = query
+    ? sessions.filter((session) => {
+        const title = (session.title || "").toLowerCase()
+        const dir = (session.project_dir || "").toLowerCase()
+        const sid = (session.session_id || "").toLowerCase()
+        return title.includes(query) || dir.includes(query) || sid.includes(query)
+      })
+    : sessions
+
   return (
     <Page title="CC Switch" subtitle="会话管理 — 查看 / 检索 / 删除 Claude Code 会话">
       <Toolbar>
@@ -313,6 +400,9 @@ export default function ClaudeCodeAdapterPanel(props: PluginSurfaceProps<PluginS
           <StatusBadge tone={sessions.length > 0 ? "success" : "warning"}>
             共 {sessions.length} 个会话
           </StatusBadge>
+          {query && filteredSessions.length !== sessions.length ? (
+            <StatusBadge tone="info">匹配 {filteredSessions.length} 个</StatusBadge>
+          ) : null}
           {loadingList ? <StatusBadge tone="info">扫描中…</StatusBadge> : null}
         </ToolbarGroup>
         <ToolbarGroup>
@@ -329,25 +419,41 @@ export default function ClaudeCodeAdapterPanel(props: PluginSurfaceProps<PluginS
         />
       ) : (
         <div style={styles.body}>
-          {/* 左侧：会话列表 */}
+          {/* 左侧：会话列表（含搜索框） */}
           <div style={styles.sidebar}>
-            {sessions.map((session) => {
-              const id = session.session_id || ""
-              const selected = id === selectedId
-              return (
-                <div
-                  key={id}
-                  style={{ ...styles.sidebarItem, ...(selected ? styles.sidebarItemSelected : {}) }}
-                  onClick={() => onSelect(id)}
-                >
-                  <div style={styles.itemTitle}>{session.title || "(无标题)"}</div>
-                  <div style={styles.itemMeta}>
-                    <span>{projectName(session.project_dir) || "未知项目"}</span>
-                    <span>{formatTime(session.last_active_at || session.created_at)}</span>
+            <div style={styles.searchBox}>
+              <input
+                style={styles.searchInput}
+                placeholder="搜索标题 / 项目目录 / 会话 ID"
+                value={searchQuery}
+                onChange={(event: any) => setSearchQuery(event && event.target ? String(event.target.value || "") : "")}
+              />
+            </div>
+            {filteredSessions.length === 0 ? (
+              <div style={{ padding: "16px 12px", color: "#9ca3af", fontSize: "12px" }}>
+                没有匹配「{searchQuery.trim()}」的会话
+              </div>
+            ) : (
+              filteredSessions.map((session) => {
+                const id = session.session_id || ""
+                const selected = id === selectedId
+                return (
+                  <div
+                    key={id}
+                    style={{ ...styles.sidebarItem, ...(selected ? styles.sidebarItemSelected : {}) }}
+                    onClick={() => onSelect(id)}
+                  >
+                    <div style={styles.itemTitle}>{session.title || "(无标题)"}</div>
+                    <div style={styles.itemMeta}>
+                      <span>{projectName(session.project_dir) || "未知项目"}</span>
+                      <span title={formatTime(session.last_active_at || session.created_at)}>
+                        {formatRelativeTime(session.last_active_at || session.created_at)}
+                      </span>
+                    </div>
                   </div>
-                </div>
-              )
-            })}
+                )
+              })
+            )}
           </div>
 
           {/* 右侧：会话详情 */}
@@ -372,6 +478,9 @@ export default function ClaudeCodeAdapterPanel(props: PluginSurfaceProps<PluginS
                           {clipboard.copied ? "已复制 ✓" : selectedId}
                         </span>
                         {detail && detail.project_dir ? <span>{detail.project_dir}</span> : null}
+                        {detail && typeof detail.message_count === "number" ? (
+                          <span>共 {detail.message_count} 条消息</span>
+                        ) : null}
                       </div>
                     </div>
                     <button

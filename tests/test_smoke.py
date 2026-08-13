@@ -1083,5 +1083,94 @@ def test_session_roots_honor_claude_config_dir(tmp_path):
             os.environ["CLAUDE_CONFIG_DIR"] = orig
 
 
+def test_drain_tasks_bounded_wait():
+    """v0.6.3：进程退出后 drain 必须限时，超时取消卡死的读取协程。
+
+    背景：Claude 派生的子孙进程若继承 stdout 管道写端句柄，readline
+    永不 EOF，旧代码 await 读取协程无时限 → 任务永远停在 running。
+    """
+    import asyncio
+
+    _load_pkg_module("models.py", "models")
+    _load_pkg_module("errors.py", "errors")
+    _load_pkg_module("parser.py", "parser")
+    ex = _load_pkg_module("executor.py", "executor")
+
+    async def main():
+        hang_forever = asyncio.Event()
+
+        async def _hang():
+            await hang_forever.wait()  # 模拟 readline 永久阻塞
+
+        async def _boom():
+            raise RuntimeError("reader exploded")
+
+        hung = asyncio.create_task(_hang())
+        done_bad = asyncio.create_task(_boom())
+        await asyncio.sleep(0)  # 让 done_bad 先结束
+
+        # 限时等待：必须在超时后返回，不无限阻塞；卡死任务被取消
+        await asyncio.wait_for(
+            ex._drain_tasks(hung, done_bad, timeout=0.2), timeout=5.0
+        )
+        assert hung.cancelled(), "超时后卡死的读取协程必须被取消"
+
+        # 全部已完成的场景：立即返回，异常被吞掉
+        async def _ok():
+            return None
+
+        t1 = asyncio.create_task(_ok())
+        await asyncio.wait_for(ex._drain_tasks(t1, timeout=0.2), timeout=5.0)
+
+    asyncio.run(main())
+
+
+def test_stuck_running_task_reconciled_on_poll():
+    """v0.6.3：任务协程已死但状态仍 running 时，poll 必须给出确定性结果。
+
+    背景：偶发长任务中断后猫娘轮询永远拿到 running。防御性核对：
+    发现 _task 已结束但状态未到终态，强制纠正为 ERROR。
+    """
+    import asyncio
+
+    models = _load_pkg_module("models.py", "models")
+    _load_pkg_module("errors.py", "errors")
+    _load_pkg_module("parser.py", "parser")
+    _load_pkg_module("executor.py", "executor")
+    tm = _load_pkg_module("task_manager.py", "task_manager")
+
+    class _DummyExecutor:
+        async def execute(self, invocation, parser):
+            raise AssertionError("不应被执行")
+
+    async def main():
+        config = models.AdapterConfig(command="fake-claude")
+        mgr = tm.TaskManager(_DummyExecutor(), config)
+        try:
+            # 模拟：状态 RUNNING 但执行协程已意外结束
+            rec = tm.TaskRecord(task_id="stuck", prompt="p", cwd="")
+            rec.status = tm.TaskStatus.RUNNING
+            dead_task = asyncio.create_task(asyncio.sleep(0))
+            await dead_task
+            rec._task = dead_task
+            mgr._tasks["stuck"] = rec
+
+            out = await mgr.poll("stuck")
+            assert out["status"] == "error", out
+            assert "意外结束" in out["error"], out
+
+            # 终态任务不被误伤
+            rec2 = tm.TaskRecord(task_id="ok", prompt="p", cwd="")
+            rec2.status = tm.TaskStatus.DONE
+            rec2._task = dead_task
+            mgr._tasks["ok"] = rec2
+            tm.TaskManager._reconcile_stuck_record(rec2)
+            assert rec2.status == tm.TaskStatus.DONE
+        finally:
+            await mgr.stop()
+
+    asyncio.run(main())
+
+
 if __name__ == "__main__":
     subprocess.run([sys.executable, "-m", "pytest", __file__, "-v"])

@@ -143,6 +143,12 @@ entry = "plugins.claude_code_adapter:ClaudeCodeAdapterPlugin"
 
 ## 版本历史
 
+### v0.6.3 (2026-08-13)
+- **修复面板仍然 0 会话（v0.6.2 后端已扫到 73 条但前端读不到）**：宿主 `call_surface_action` 返回的是包装结构 `{plugin_id, action_id, result}`，真实数据在 `result` 里；面板直接读 `result.sessions` 永远是 undefined。现按内置插件标准做法（neko_live / neko_warthunder）用 `unwrapActionResult` 解包，list/get/delete 三处全修
+- **面板体验参考 cc-switch 会话管理页完善**：新增会话搜索框（标题/项目目录/会话 ID）、相对时间（刚刚/X 分钟前/X 小时前）、长消息折叠（>3000 字符折叠到 1500 + 展开按钮）、消息数与匹配数徽标
+- **修复长任务偶发“中断但状态永远 running”**：① asyncio StreamReader 默认单行上限仅 64KB，stream-json 长行（长文本/工具输出/图片）超限会抛 ValueError 杀死读取协程，管道写满后 CLI 永久卡死——现调大到 32MB 且超限只截断不中断；② CLI 退出后若子孙进程继承管道写端句柄，readline 永不 EOF，drain 无限等待——现限时 15s，超时取消读取协程继续收尾并记警告日志
+- **防御性状态核对**：poll/wait/监控发现任务协程已意外结束但状态仍停在 running 时，强制纠正为 error 并给出提示（可用 session_id 续跑），猫娘不会再无限拿到 running
+
 ### v0.6.2 (2026-08-13)
 - **修复面板扫描 0 会话**：Steam 启动的插件进程 HOME/USERPROFILE 环境变量与真实用户目录不一致，仅靠 `os.path.expanduser("~")` 会扫错目录。参照 cc-switch（Rust `dirs::home_dir()` 走 Windows Known Folder API）改为多候选解析：Known Folder API / USERPROFILE / expanduser 全部尝试并合并去重，另支持 `CLAUDE_CONFIG_DIR` 环境变量（Claude Code 官方）
 - 会话扫描入口增加诊断日志（候选目录 + 扫描数量），便于后续取证

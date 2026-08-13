@@ -236,7 +236,28 @@ class TaskManager:
             record = self._tasks.get(task_id)
             if not record:
                 return {"error": f"Task not found: {task_id}"}
+            self._reconcile_stuck_record(record)
             return record.to_dict()
+
+    @staticmethod
+    def _reconcile_stuck_record(record: TaskRecord) -> None:
+        """防御性核对：任务协程已结束但状态仍是 PENDING/RUNNING 时强制纠正。
+
+        正常路径下 _execute_task 总会把状态推进到终态；但若协程被
+        意外吞掉（如事件循环关闭、未预期的异常逃逸），状态会永远停在
+        running，猫娘轮询永远拿不到结果。查询时发现协程已死则直接
+        标记 ERROR，让调用方拿到确定性结果（可用 session_id 续跑）。
+        """
+        if record.status not in (TaskStatus.PENDING, TaskStatus.RUNNING):
+            return
+        task = record._task
+        if task is not None and task.done():
+            record.status = TaskStatus.ERROR
+            record.error_message = (
+                "任务执行协程已意外结束但未写入结果，已强制标记为失败；"
+                "若会话已有进展，可用 session_id 续跑（--resume）。"
+            )
+            record.finished_at = record.finished_at or time.time()
 
     def get_record(self, task_id: str) -> Optional[TaskRecord]:
         """返回任务记录对象（不存在时返回 None）。供插件主类编排用。"""
@@ -270,6 +291,7 @@ class TaskManager:
                 record = self._tasks.get(task_id)
                 if not record:
                     return {"error": f"Task not found: {task_id}"}
+                self._reconcile_stuck_record(record)
                 if record.status in (
                     TaskStatus.DONE,
                     TaskStatus.ERROR,
@@ -472,4 +494,6 @@ class TaskManager:
 
     def get_all_tasks(self) -> List[Dict[str, Any]]:
         """获取所有任务的状态（用于调试/监控）"""
+        for record in self._tasks.values():
+            self._reconcile_stuck_record(record)
         return [record.to_dict() for record in self._tasks.values()]
