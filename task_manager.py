@@ -158,10 +158,14 @@ class TaskManager:
                 pass
             self._cleanup_task = None
 
-        # 取消所有运行中的任务
+        # 取消所有未完成任务（PENDING 在队列中、RUNNING 在执行中，
+        # 都必须取消，避免插件关闭后留下无人管控的 CLI 进程）
         async with self._lock:
             for record in self._tasks.values():
-                if record.status == TaskStatus.RUNNING and record._task:
+                if (
+                    record.status in (TaskStatus.PENDING, TaskStatus.RUNNING)
+                    and record._task
+                ):
                     record._task.cancel()
                     try:
                         await record._task

@@ -143,6 +143,11 @@ entry = "plugins.claude_code_adapter:ClaudeCodeAdapterPlugin"
 
 ## 版本历史
 
+### v0.6.1 (2026-08-13)
+- **修复孤儿进程（严重安全问题）**：任务取消/插件重载 shutdown 时只取消了 asyncio 任务，CLI 子进程树从未被杀——Windows 上 `proc.kill()` 只杀 cmd shim，claude.exe 成为孤儿进程在用户不知情下继续自主执行旧指令（甚至内部再 spawn 新进程）。现在统一按进程树强杀（Windows `taskkill /F /T`、POSIX `killpg(SIGKILL)`），取消/超时/shutdown 三条路径全覆盖
+- TaskManager.stop() 补上 PENDING 任务取消（此前只取消 RUNNING，队列中的任务关闭后仍会跑）
+- **修复面板报“扫描会话失败：Failed to query plugin UI action context”**：插件缺少 `@ui.context(id="dashboard")` provider 注册，面板所有 action 调用直接失败；已按宿主约定注册 UI context，并为会话管理入口注册 `@ui.action`
+
 ### v0.6.0 (2026-08-13)
 - **全异步化**：移除同步 `claude_code_execute`（会被网关 ~60s ReadTimeout 卡死），`claude_code_submit` 成为唯一执行入口
 - **无超时限制**：默认 `timeout_sec = 0`，支持半小时到一小时以上的长任务（修复异步任务硬编码 300s 超时导致长任务必失败的问题）

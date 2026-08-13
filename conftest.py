@@ -41,6 +41,19 @@ if "plugin" not in sys.modules:
     mock_plugin_module.Err = lambda x: x
     mock_plugin_module.SdkError = Exception
 
+    class _FakeUi:
+        """ui 装饰器替身：透传原方法，避免被 MagicMock 替换。"""
+
+        @staticmethod
+        def context(**_kwargs):
+            return lambda x: x
+
+        @staticmethod
+        def action(**_kwargs):
+            return lambda x: x
+
+    mock_plugin_module.ui = _FakeUi
+
     sys.modules["plugin"] = MagicMock()
     sys.modules["plugin.sdk"] = MagicMock()
     sys.modules["plugin.sdk.plugin"] = mock_plugin_module

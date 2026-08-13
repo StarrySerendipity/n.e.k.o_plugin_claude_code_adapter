@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
+import subprocess
 import sys
 from typing import Any, Optional
 
@@ -174,6 +175,50 @@ def build_cli_invocation(
 
 
 # ---------------------------------------------------------------------------
+# 进程树终止
+# ---------------------------------------------------------------------------
+
+
+def kill_process_tree(proc: asyncio.subprocess.Process, logger: Any = None) -> None:
+    """同步强杀子进程及其整棵进程树。
+
+    Windows 上 CLI 经 .cmd shim 启动（cmd → node → claude.exe），
+    ``proc.kill()`` 只会杀掉 shim 本身，真正的 claude 进程会成为
+    孤儿继续自主执行旧指令（曾导致插件重载/任务取消后 Claude Code
+    在用户不知情下继续跑）。因此必须按进程树终止：
+    - Windows: taskkill /F /T /PID
+    - POSIX: 优先杀进程组，失败再单杀
+    """
+    pid = getattr(proc, "pid", None)
+    if not pid:
+        return
+    try:
+        if proc.returncode is None:
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/F", "/T", "/PID", str(pid)],
+                    capture_output=True,
+                    timeout=10,
+                )
+            else:
+                import signal
+
+                try:
+                    os.killpg(os.getpgid(pid), signal.SIGKILL)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+    except Exception as e:
+        if logger is not None:
+            try:
+                logger.warning("kill process tree failed: pid={}: {}", pid, e)
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
 # 子进程执行器
 # ---------------------------------------------------------------------------
 
@@ -290,6 +335,36 @@ class ClaudeCLIExecutor:
         stderr_task = asyncio.create_task(_read_stderr())
         stdout_task = asyncio.create_task(_read_stdout())
 
+        try:
+            return await self._run_process(
+                proc, parser, invocation, stderr_lines, stderr_task, stdout_task
+            )
+        except asyncio.CancelledError:
+            # 任务被取消（followup 中断 / 插件重载 shutdown）：
+            # 必须杀掉整棵 CLI 进程树，否则 claude 会成为孤儿进程
+            # 在用户不知情下继续自主执行旧指令。
+            kill_process_tree(proc, self.logger)
+            stdout_task.cancel()
+            stderr_task.cancel()
+            if self.logger is not None:
+                try:
+                    self.logger.info(
+                        "CLI process tree killed on cancel: pid={}", proc.pid
+                    )
+                except Exception:
+                    pass
+            raise
+
+    async def _run_process(
+        self,
+        proc: asyncio.subprocess.Process,
+        parser: ClaudeOutputParser,
+        invocation: CLIInvocation,
+        stderr_lines: list[str],
+        stderr_task: asyncio.Task,
+        stdout_task: asyncio.Task,
+    ) -> tuple[ParsedStream, Optional[ClassifiedError]]:
+        """写入 stdin 并等待进程结束，返回解析结果。"""
         # 写入 stdin 并关闭
         try:
             if proc.stdin is not None:
@@ -312,9 +387,9 @@ class ClaudeCLIExecutor:
             else:
                 return_code = await proc.wait()
         except asyncio.TimeoutError:
-            # 超时 — 杀死进程
+            # 超时 — 杀整棵进程树（只杀 shim 会留下孤儿 claude）
+            kill_process_tree(proc, self.logger)
             try:
-                proc.kill()
                 await proc.wait()
             except Exception:
                 pass
@@ -378,5 +453,6 @@ __all__ = [
     "find_windows_shim",
     "detect_claude_cli",
     "build_cli_invocation",
+    "kill_process_tree",
     "ClaudeCLIExecutor",
 ]

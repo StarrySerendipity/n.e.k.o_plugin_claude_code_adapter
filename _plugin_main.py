@@ -43,6 +43,7 @@ from plugin.sdk.plugin import (
     llm_tool,
     neko_plugin,
     plugin_entry,
+    ui,
 )
 
 from . import claude_sessions
@@ -1355,9 +1356,44 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
             return Err(SdkError(f"提交任务失败: {e}"))
 
     # ------------------------------------------------------------------
+    # Hosted panel UI context（缺它面板 api.call 会报
+    # "UI context 'dashboard' not found" → 扫描会话失败）
+    # ------------------------------------------------------------------
+
+    @ui.context(id="dashboard", title="CC Switch 会话管理")
+    async def dashboard_ui_context(self, **_) -> dict[str, Any]:
+        """panel:main surface 的只读上下文 provider。
+
+        hosted-surface 的 ``api.call`` 走 ``call_surface_action`` →
+        ``host.get_ui_context(<surface 的 context_id>)``，缺少对应
+        provider 会让面板所有 action 调用直接失败。这里只返回
+        轻量状态快照，真实数据由面板通过下方 @ui.action 条目拉取。
+        """
+        tasks: list[dict[str, Any]] = []
+        mgr = self._task_mgr
+        if mgr is not None:
+            for record in list(mgr._tasks.values()):
+                if record.status in (TaskStatus.PENDING, TaskStatus.RUNNING):
+                    tasks.append(
+                        {
+                            "task_id": record.task_id,
+                            "status": record.status.value,
+                            "session_id": record.session_id,
+                        }
+                    )
+        return {
+            "ready": self._ready,
+            "active_provider": self._provider_mgr.get_active_name()
+            if self._provider_mgr
+            else "",
+            "active_tasks": tasks,
+        }
+
+    # ------------------------------------------------------------------
     # Claude 原生会话管理（供前端面板调用，照搬 cc-switch 会话管理器能力）
     # ------------------------------------------------------------------
 
+    @ui.action(label="扫描会话", group="sessions", order=10)
     @plugin_entry(
         id="list_claude_sessions",
         name="列出 Claude 会话",
@@ -1381,6 +1417,7 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
             self.logger.exception("list_claude_sessions_entry failed")
             return Err(SdkError(f"扫描会话失败: {e}"))
 
+    @ui.action(label="读取会话消息", group="sessions", order=20)
     @plugin_entry(
         id="get_claude_session",
         name="读取会话消息",
@@ -1426,6 +1463,7 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
             self.logger.exception("get_claude_session_entry failed")
             return Err(SdkError(f"读取会话失败: {e}"))
 
+    @ui.action(label="删除会话", tone="danger", group="sessions", order=30)
     @plugin_entry(
         id="delete_claude_session",
         name="删除 Claude 会话",

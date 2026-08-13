@@ -902,5 +902,103 @@ def test_running_progress_and_wait_clamp():
     asyncio.run(main())
 
 
+def test_cancel_kills_cli_process_tree():
+    """v0.6.1：取消/重载时必须杀整棵 CLI 进程树，不留孤儿 claude 进程。
+
+    背景：曾出现插件重载后旧会话的 claude.exe 成为孤儿进程，
+    在用户不知情下继续自主执行旧指令。
+    """
+    import asyncio
+
+    models = _load_pkg_module("models.py", "models")
+    _load_pkg_module("errors.py", "errors")
+    _load_pkg_module("parser.py", "parser")
+    ex = _load_pkg_module("executor.py", "executor")
+
+    class _FakeProc:
+        pid = 424242
+        returncode = None
+        stdin = None
+        stdout = None
+        stderr = None
+
+        def kill(self):
+            pass
+
+    # 1) kill_process_tree：Windows 走 taskkill /F /T 按树终止
+    calls = []
+    orig_run = ex.subprocess.run
+    ex.subprocess.run = lambda cmd, **kw: calls.append(("run", cmd))
+    try:
+        if ex.os.name == "nt":
+            ex.kill_process_tree(_FakeProc())
+            assert any(
+                c[0] == "run"
+                and c[1][:4] == ["taskkill", "/F", "/T", "/PID"]
+                and c[1][4] == "424242"
+                for c in calls
+            ), calls
+        else:
+            orig_killpg = ex.os.killpg
+            ex.os.killpg = lambda *a: calls.append(("killpg", a))
+            try:
+                ex.kill_process_tree(_FakeProc())
+            finally:
+                ex.os.killpg = orig_killpg
+            assert any(c[0] == "killpg" for c in calls), calls
+    finally:
+        ex.subprocess.run = orig_run
+
+    # 已退出的进程不再杀（returncode 非 None）
+    calls.clear()
+    dead = _FakeProc()
+    dead.returncode = 0
+    ex.subprocess.run = lambda cmd, **kw: calls.append(("run", cmd))
+    try:
+        ex.kill_process_tree(dead)
+        assert calls == [], "已退出的进程不应再 taskkill"
+    finally:
+        ex.subprocess.run = orig_run
+
+    # 2) execute() 被取消：必须杀进程树并重抛 CancelledError
+    killed: list[int] = []
+    orig_kpt = ex.kill_process_tree
+    ex.kill_process_tree = lambda proc, logger=None: killed.append(proc.pid)
+    orig_spawn = asyncio.create_subprocess_exec
+
+    class _HangProc(_FakeProc):
+        pid = 777
+
+    async def _fake_spawn(*args, **kwargs):
+        return _HangProc()
+
+    async def main():
+        config = models.AdapterConfig(command="fake-claude")
+        executor = ex.ClaudeCLIExecutor(config, logger=None)
+
+        async def _hang(*a, **k):
+            raise asyncio.CancelledError()
+
+        executor._run_process = _hang
+        inv = models.CLIInvocation(
+            cmd=["fake-claude"], cwd="", stdin_data=b"hi", timeout=0.0
+        )
+        asyncio.create_subprocess_exec = _fake_spawn
+        try:
+            try:
+                await executor.execute(inv, object())
+                raise AssertionError("取消后必须重抛 CancelledError")
+            except asyncio.CancelledError:
+                pass
+            assert killed == [777], "取消时必须按进程树终止 CLI 子进程"
+        finally:
+            asyncio.create_subprocess_exec = orig_spawn
+
+    try:
+        asyncio.run(main())
+    finally:
+        ex.kill_process_tree = orig_kpt
+
+
 if __name__ == "__main__":
     subprocess.run([sys.executable, "-m", "pytest", __file__, "-v"])
