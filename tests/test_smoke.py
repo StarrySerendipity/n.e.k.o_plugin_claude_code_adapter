@@ -1,5 +1,6 @@
 """Claude Code Adapter 插件冒烟测试。"""
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -514,9 +515,11 @@ def test_resolve_resume_uuid_locates_project_dir(tmp_path):
         encoding="utf-8",
     )
 
-    # 将存档根指向临时目录
-    orig_root = cs.claude_projects_root
-    cs.claude_projects_root = lambda home=None: str(tmp_path / ".claude" / "projects")
+    # 将存档根指向临时目录（patch 新的候选解析入口）
+    orig_roots = cs.candidate_project_roots
+    cs.candidate_project_roots = lambda home=None: [
+        str(tmp_path / ".claude" / "projects")
+    ]
 
     class _FakeMgr:
         async def find_resumable(self, cwd, signature):
@@ -584,7 +587,7 @@ def test_resolve_resume_uuid_locates_project_dir(tmp_path):
 
         asyncio.run(main())
     finally:
-        cs.claude_projects_root = orig_root
+        cs.candidate_project_roots = orig_roots
 
 
 def test_followup_interrupt_and_resume(tmp_path):
@@ -650,8 +653,10 @@ def test_followup_interrupt_and_resume(tmp_path):
         ),
         encoding="utf-8",
     )
-    orig_root = cs.claude_projects_root
-    cs.claude_projects_root = lambda home=None: str(tmp_path / ".claude" / "projects")
+    orig_roots = cs.candidate_project_roots
+    cs.candidate_project_roots = lambda home=None: [
+        str(tmp_path / ".claude" / "projects")
+    ]
 
     try:
 
@@ -722,7 +727,7 @@ def test_followup_interrupt_and_resume(tmp_path):
 
         asyncio.run(main())
     finally:
-        cs.claude_projects_root = orig_root
+        cs.candidate_project_roots = orig_roots
 
 
 def test_async_no_timeout_and_on_complete():
@@ -998,6 +1003,84 @@ def test_cancel_kills_cli_process_tree():
         asyncio.run(main())
     finally:
         ex.kill_process_tree = orig_kpt
+
+
+def test_session_roots_survive_broken_env():
+    """v0.6.2：进程环境变量被篡改（Steam 启动器场景）时仍能扫到会话。
+
+    背景：Steam 启动的插件进程 HOME/USERPROFILE 与真实用户目录不一致，
+    仅靠 os.path.expanduser("~") 解析会扫错目录导致面板 0 会话。
+    参照 cc-switch（Rust dirs::home_dir 走 Known Folder API）多候选解析。
+    """
+    mod = _load_pkg_module("claude_sessions.py", "claude_sessions_t3")
+
+    # 显式 home 参数只扫该目录（测试隔离语义不变）
+    assert mod.candidate_project_roots(home="/tmp/fake-home") == [
+        os.path.join("/tmp/fake-home", ".claude", "projects")
+    ]
+
+    if os.name != "nt":
+        return  # Known Folder API 仅 Windows，以下场景不适用
+
+    # 模拟环境变量被篡改：home 解析指向错误位置，扫描仍由 Known Folder 兜底
+    fake_home = r"C:\BogusNekoSteamDir"
+    orig = {k: os.environ.get(k) for k in ("HOME", "USERPROFILE", "CLAUDE_CONFIG_DIR")}
+    os.environ["HOME"] = fake_home
+    os.environ["USERPROFILE"] = fake_home
+    os.environ.pop("CLAUDE_CONFIG_DIR", None)
+    try:
+        assert os.path.expanduser("~") == fake_home  # 前置：环境确实被破坏
+        roots = mod.candidate_project_roots()
+        # 兜底候选必须包含真实用户目录（Known Folder API 解析）
+        assert any(fake_home not in r for r in roots), roots
+        real_root = mod.claude_projects_root()
+        assert fake_home not in real_root, real_root
+        # 真实机器上应能扫到会话（本机无 Claude 存档时至少不报错）
+        sessions = mod.scan_sessions(limit=10)
+        assert isinstance(sessions, list)
+    finally:
+        for k, v in orig.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def test_session_roots_honor_claude_config_dir(tmp_path):
+    """v0.6.2：CLAUDE_CONFIG_DIR 环境变量（Claude Code 官方）优先于 home。"""
+    import json
+
+    mod = _load_pkg_module("claude_sessions.py", "claude_sessions_t4")
+
+    # 在自定义配置目录下造一个会话
+    project_dir = tmp_path / "projects" / "-D-custom"
+    project_dir.mkdir(parents=True)
+    (project_dir / "sess-cfg.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "sessionId": "sess-cfg",
+                "cwd": "D:\\custom",
+                "timestamp": "2026-08-13T10:00:00.000Z",
+                "message": {"role": "user", "content": "配置目录会话"},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    orig = os.environ.get("CLAUDE_CONFIG_DIR")
+    os.environ["CLAUDE_CONFIG_DIR"] = str(tmp_path)
+    try:
+        roots = mod.candidate_project_roots()
+        assert roots[0] == str(tmp_path / "projects"), roots
+        sessions = mod.scan_sessions(limit=50)
+        assert any(s["session_id"] == "sess-cfg" for s in sessions), sessions
+    finally:
+        if orig is None:
+            os.environ.pop("CLAUDE_CONFIG_DIR", None)
+        else:
+            os.environ["CLAUDE_CONFIG_DIR"] = orig
 
 
 if __name__ == "__main__":

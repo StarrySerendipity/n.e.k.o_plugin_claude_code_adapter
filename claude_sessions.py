@@ -38,10 +38,119 @@ TAIL_LINES = 30
 # ---------------------------------------------------------------------------
 
 
+def _windows_known_folder_home() -> Optional[str]:
+    """用 Windows Known Folder API 获取用户主目录。
+
+    等价于 cc-switch（Rust ``dirs::home_dir()``）的做法：不受进程
+    环境变量（HOME/USERPROFILE）影响。实测发现 Steam 启动的 N.E.K.O
+    插件进程环境变量与真实用户目录不一致，仅靠
+    ``os.path.expanduser("~")`` 会扫错目录导致 0 会话。
+    """
+    if os.name != "nt":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _GUID(ctypes.Structure):
+            _fields_ = [
+                ("Data1", wintypes.DWORD),
+                ("Data2", wintypes.WORD),
+                ("Data3", wintypes.WORD),
+                ("Data4", wintypes.BYTE * 8),
+            ]
+
+        # FOLDERID_Profile = {5E6C858F-0E22-4760-9AFE-EA3317B67173}
+        folder_id = _GUID(
+            0x5E6C858F,
+            0x0E22,
+            0x4760,
+            (wintypes.BYTE * 8)(0x9A, 0xFE, 0xEA, 0x33, 0x17, 0xB6, 0x71, 0x73),
+        )
+        ptr = ctypes.c_wchar_p()
+        hr = ctypes.windll.shell32.SHGetKnownFolderPath(
+            ctypes.byref(folder_id), 0, None, ctypes.byref(ptr)
+        )
+        if hr == 0 and ptr.value:
+            path = ptr.value
+            ctypes.windll.ole32.CoTaskMemFree(ptr)
+            return path
+    except Exception:
+        return None
+    return None
+
+
+def _candidate_home_dirs(home: Optional[str]) -> list[str]:
+    """按优先级返回去重后的 home 目录候选列表。"""
+    candidates: list[str] = []
+    for value in (
+        home,
+        _windows_known_folder_home(),
+        os.environ.get("USERPROFILE"),
+        os.path.expanduser("~"),
+    ):
+        if not value:
+            continue
+        normalized = os.path.normpath(value)
+        if all(
+            os.path.normcase(existing) != os.path.normcase(normalized)
+            for existing in candidates
+        ):
+            candidates.append(normalized)
+    return candidates
+
+
+def candidate_project_roots(home: Optional[str] = None) -> list[str]:
+    """按优先级返回会话存档目录候选列表。
+
+    - 显式传入的 ``home``（测试隔离用）→ 只扫该目录
+    - ``CLAUDE_CONFIG_DIR`` 环境变量（Claude Code 官方支持的配置目录）
+    - 各 home 候选的 ``<home>/.claude/projects``
+      （home 解析等价 cc-switch：Windows 优先 Known Folder API，
+      避免启动器篡改环境变量导致扫错目录）
+    """
+    if home:
+        return [os.path.join(home, ".claude", "projects")]
+
+    roots: list[str] = []
+    config_dir = os.environ.get("CLAUDE_CONFIG_DIR", "").strip()
+    if config_dir:
+        roots.append(os.path.join(os.path.expanduser(config_dir), "projects"))
+    for home_dir in _candidate_home_dirs(None):
+        roots.append(os.path.join(home_dir, ".claude", "projects"))
+    if not roots:
+        roots.append(os.path.join(os.path.expanduser("~"), ".claude", "projects"))
+    return roots
+
+
 def claude_projects_root(home: Optional[str] = None) -> str:
-    """返回 Claude 会话存档根目录 ``~/.claude/projects``。"""
-    base = home or os.path.expanduser("~")
-    return os.path.join(base, ".claude", "projects")
+    """返回 Claude 会话存档根目录 ``~/.claude/projects``。
+
+    在多个候选中取第一个存在的目录；进程环境变量异常时
+    （如 Steam 启动器）由 Windows Known Folder API 兜底。
+    """
+    roots = candidate_project_roots(home)
+    for root in roots:
+        if os.path.isdir(root):
+            return root
+    return roots[0]
+
+
+def _collect_all_jsonl_files(home: Optional[str] = None) -> list[str]:
+    """跨所有候选存档目录收集 .jsonl 文件（按规范化路径去重）。"""
+    files: list[str] = []
+    seen: set[str] = set()
+    for root in candidate_project_roots(home):
+        if not os.path.isdir(root):
+            continue
+        batch: list[str] = []
+        _collect_jsonl_files(root, batch)
+        for path in batch:
+            key = os.path.normcase(os.path.abspath(path))
+            if key not in seen:
+                seen.add(key)
+                files.append(path)
+    return files
 
 
 def _truncate(text: str, max_chars: int) -> str:
@@ -268,12 +377,8 @@ def scan_sessions(
     home: Optional[str] = None, limit: int = DEFAULT_SCAN_LIMIT
 ) -> list[dict[str, Any]]:
     """扫描所有 Claude 会话，按最近活跃时间降序返回。"""
-    root = claude_projects_root(home)
-    files: list[str] = []
-    _collect_jsonl_files(root, files)
-
     sessions: list[dict[str, Any]] = []
-    for path in files:
+    for path in _collect_all_jsonl_files(home):
         meta = _parse_session(path)
         if meta is not None:
             sessions.append(meta)
@@ -319,9 +424,7 @@ def find_session_by_id(
     sid = normalize_session_ref(session_id)
     if not sid:
         return None
-    root = claude_projects_root(home)
-    files: list[str] = []
-    _collect_jsonl_files(root, files)
+    files = _collect_all_jsonl_files(home)
 
     # 精确匹配：文件名 stem == uuid
     for path in files:
@@ -453,6 +556,7 @@ def delete_session(source_path: str, session_id: str) -> bool:
 
 __all__ = [
     "claude_projects_root",
+    "candidate_project_roots",
     "scan_sessions",
     "normalize_session_ref",
     "find_session_by_id",

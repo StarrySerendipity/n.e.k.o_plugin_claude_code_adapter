@@ -143,6 +143,10 @@ entry = "plugins.claude_code_adapter:ClaudeCodeAdapterPlugin"
 
 ## 版本历史
 
+### v0.6.2 (2026-08-13)
+- **修复面板扫描 0 会话**：Steam 启动的插件进程 HOME/USERPROFILE 环境变量与真实用户目录不一致，仅靠 `os.path.expanduser("~")` 会扫错目录。参照 cc-switch（Rust `dirs::home_dir()` 走 Windows Known Folder API）改为多候选解析：Known Folder API / USERPROFILE / expanduser 全部尝试并合并去重，另支持 `CLAUDE_CONFIG_DIR` 环境变量（Claude Code 官方）
+- 会话扫描入口增加诊断日志（候选目录 + 扫描数量），便于后续取证
+
 ### v0.6.1 (2026-08-13)
 - **修复孤儿进程（严重安全问题）**：任务取消/插件重载 shutdown 时只取消了 asyncio 任务，CLI 子进程树从未被杀——Windows 上 `proc.kill()` 只杀 cmd shim，claude.exe 成为孤儿进程在用户不知情下继续自主执行旧指令（甚至内部再 spawn 新进程）。现在统一按进程树强杀（Windows `taskkill /F /T`、POSIX `killpg(SIGKILL)`），取消/超时/shutdown 三条路径全覆盖
 - TaskManager.stop() 补上 PENDING 任务取消（此前只取消 RUNNING，队列中的任务关闭后仍会跑）

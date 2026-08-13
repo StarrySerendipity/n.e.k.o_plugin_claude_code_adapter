@@ -1412,6 +1412,11 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
         """扫描 Claude 原生会话存档。"""
         try:
             sessions = claude_sessions.scan_sessions(limit=int(limit or 200))
+            self.logger.info(
+                "Session scan finished: roots={} count={}",
+                claude_sessions.candidate_project_roots(),
+                len(sessions),
+            )
             return Ok({"count": len(sessions), "sessions": sessions})
         except Exception as e:
             self.logger.exception("list_claude_sessions_entry failed")

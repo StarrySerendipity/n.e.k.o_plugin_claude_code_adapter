@@ -36,7 +36,7 @@ keywords = [
     "provider",
     "session-manager",
 ]
-version = "0.6.1"
+version = "0.6.2"
 id = "claude_code_adapter"
 entry = "plugin.plugins.claude_code_adapter._plugin_main:ClaudeCodeAdapterPlugin"
 
