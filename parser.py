@@ -94,11 +94,15 @@ class ClaudeOutputParser:
         stream = parser.finalize()
     """
 
-    def __init__(self) -> None:
+    def __init__(self, on_session_id: Optional[Callable[[str], None]] = None) -> None:
         self._system: Optional[SystemEvent] = None
         self._messages: list[AssistantMessage] = []
         self._result: Optional[ResultEvent] = None
         self._parse_errors: list[str] = []
+        # session_id 首次捕获回调（init 事件到达时立即触发，
+        # 供任务管理器在任务执行中途感知会话 UUID，支持中断后续发）
+        self._on_session_id = on_session_id
+        self._session_notified = False
 
     # ------------------------------------------------------------------
     # 逐行解析
@@ -143,6 +147,16 @@ class ClaudeOutputParser:
         self._parse_errors.append(f"unknown type {event_type!r}: {line[:200]}")
         return None
 
+    def _notify_session_id(self, session_id: str) -> None:
+        """首次捕获到 session_id 时触发一次回调。"""
+        if self._session_notified or not session_id or self._on_session_id is None:
+            return
+        self._session_notified = True
+        try:
+            self._on_session_id(session_id)
+        except Exception:
+            pass
+
     def _handle_system(self, payload: dict[str, Any]) -> SystemEvent:
         # system 事件结构：{"type":"system","subtype":"init","session_id":"...","cwd":"...",...}
         event = SystemEvent(
@@ -154,6 +168,7 @@ class ClaudeOutputParser:
         # 只保留第一个 system 事件（init）
         if self._system is None:
             self._system = event
+            self._notify_session_id(event.session_id)
         return event
 
     def _handle_assistant(self, payload: dict[str, Any]) -> AssistantMessage:
@@ -205,6 +220,8 @@ class ClaudeOutputParser:
             raw=payload,
         )
         self._result = event
+        # system 事件缺失时的兜底：result 事件也携带 session_id
+        self._notify_session_id(event.session_id)
         return event
 
     # ------------------------------------------------------------------

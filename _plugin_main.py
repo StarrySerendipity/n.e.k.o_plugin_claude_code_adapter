@@ -8,6 +8,8 @@
 - claude_code_submit / claude_code_poll / claude_code_wait /
   claude_code_cancel: 异步提交 + 智能等待/轮询模式，
   避免 main_server 的 300 秒超时限制
+- claude_code_followup: 任务执行中/完成后在同一会话追加补充或纠正指令
+  （自动中断跑偏的任务，保留上下文续发）
 - claude_code_check_health / claude_code_list_sessions /
   claude_code_clear_session / claude_code_get_config: 辅助工具
 - claude_code_list_providers / claude_code_switch_provider /
@@ -52,7 +54,7 @@ from .models import AdapterConfig, ExecuteResult
 from .parser import ClaudeOutputParser
 from .provider_manager import Provider, ProviderManager
 from .session import SessionManager, compute_prompt_signature
-from .task_manager import TaskManager
+from .task_manager import TaskManager, TaskStatus
 
 
 @neko_plugin
@@ -854,6 +856,180 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
         except Exception as e:
             self.logger.exception("claude_code_cancel failed")
             return Err(SdkError(f"取消任务失败: {e}"))
+
+    @llm_tool(
+        name="claude_code_followup",
+        description=(
+            "在同一个 Claude Code 会话中追加补充/纠正指令（异步执行）。\n\n"
+            "适用场景：\n"
+            "- 任务正在执行，用户发现方向有偏差，需要立即纠正：\n"
+            "  传 task_id，插件会先中断当前任务，再在同一会话（同一 UUID）里\n"
+            "  把纠正指令发给 Claude Code，已有上下文全部保留\n"
+            "- 任务已完成，想对同一成果继续提要求：传 task_id 或 session_id 均可\n\n"
+            "参数说明：\n"
+            "- instruction: 要追加的补充/纠正指令（必填），要具体清晰\n"
+            "- task_id: 目标异步任务 ID（从 claude_code_submit 返回）。\n"
+            "  任务运行中→自动中断后续发；已完成→直接在它的会话里续发\n"
+            "- session_id: Claude Code 会话 UUID（与 task_id 二选一）。\n"
+            "  支持完整 UUID、唯一前缀或 'claude --resume <uuid>' 命令形态\n\n"
+            "返回：新的 task_id 和续用的 session_id；"
+            "后续用 claude_code_wait 等待追加指令的执行结果。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "instruction": {
+                    "type": "string",
+                    "description": "要追加给 Claude Code 的补充/纠正指令。要具体、清晰。",
+                },
+                "task_id": {
+                    "type": "string",
+                    "description": (
+                        "目标异步任务 ID（从 claude_code_submit 返回）。"
+                        "任务运行中会先被中断，然后在同一会话续发。与 session_id 二选一。"
+                    ),
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": (
+                        "Claude Code 会话 UUID（与 task_id 二选一）。"
+                        "支持完整 UUID、唯一前缀或 'claude --resume <uuid>' 命令形态。"
+                    ),
+                },
+                "model": {
+                    "type": "string",
+                    "description": "模型 ID（可选）。留空使用默认配置。",
+                },
+                "effort": {
+                    "type": "string",
+                    "description": "推理努力级别（可选）：'low' / 'medium' / 'high'。",
+                    "enum": ["", "low", "medium", "high"],
+                },
+                "max_turns": {
+                    "type": "integer",
+                    "description": "最大轮次（可选，0=使用默认值）。",
+                },
+            },
+            "required": ["instruction"],
+        },
+        timeout=30.0,
+    )
+    async def claude_code_followup(
+        self,
+        instruction: str = "",
+        task_id: str = "",
+        session_id: str = "",
+        model: str = "",
+        effort: str = "",
+        max_turns: int = 0,
+        **_,
+    ) -> dict[str, Any]:
+        """在同一会话中追加补充/纠正指令。"""
+        not_ready = self._ensure_ready()
+        if not_ready is not None:
+            return not_ready
+
+        if not instruction or not instruction.strip():
+            return Err(SdkError("instruction 不能为空"))
+        if self._task_mgr is None:
+            return Err(SdkError("TaskManager not initialized"))
+
+        tid = (task_id or "").strip()
+        sid_ref = (session_id or "").strip()
+        if not tid and not sid_ref:
+            return Err(
+                SdkError(
+                    "需要指定 task_id（正在执行/已完成的异步任务）或 "
+                    "session_id（Claude Code 会话 UUID）之一，"
+                    "以确定追加指令的目标会话。"
+                )
+            )
+
+        try:
+            target_sid = ""
+            fallback_cwd = ""
+            interrupted = False
+
+            if tid:
+                # 从异步任务定位目标会话
+                record = self._task_mgr.get_record(tid)
+                if record is None:
+                    return Err(SdkError(f"Task not found: {tid}"))
+                fallback_cwd = record.cwd
+                running = record.status in (
+                    TaskStatus.PENDING,
+                    TaskStatus.RUNNING,
+                )
+                if running:
+                    # 中断跑偏的任务；session_id 已在 init 事件时早期捕获
+                    cancel_result = await self._task_mgr.cancel(tid)
+                    if "error" in cancel_result:
+                        return Err(SdkError(cancel_result["error"]))
+                    interrupted = True
+                target_sid = record.session_id or record.resume_session_id
+                if not target_sid:
+                    return Err(
+                        SdkError(
+                            f"任务 {tid} 尚未建立 Claude Code 会话"
+                            "（CLI 还没输出 init 事件），无法在同一会话续发。"
+                            "请稍等几秒后重试，或直接重新提交任务。"
+                        )
+                    )
+            else:
+                # 直接按会话 UUID 定位（支持裸 UUID / 唯一前缀 / 命令形态）
+                ref = claude_sessions.normalize_session_ref(sid_ref)
+                meta = claude_sessions.find_session_by_id(ref)
+                if meta is None:
+                    return Err(
+                        SdkError(
+                            f"未找到 session_id={sid_ref!r} 对应的 Claude Code 会话。"
+                            "可用 claude_code_list_sessions(include_history=true) "
+                            "或插件面板查看历史会话 UUID。"
+                        )
+                    )
+                target_sid = str(meta.get("session_id") or ref)
+                fallback_cwd = str(meta.get("project_dir") or "")
+
+            # 工作目录：会话归属目录优先（Claude CLI 按 cwd 索引会话），
+            # 存档未落盘时回退到任务提交时的 cwd
+            effective_cwd = ""
+            try:
+                meta = claude_sessions.find_session_by_id(target_sid)
+                if meta and meta.get("project_dir"):
+                    effective_cwd = str(meta["project_dir"])
+            except Exception:
+                pass
+            effective_cwd = (
+                effective_cwd or fallback_cwd or self._config.cwd or os.getcwd()
+            )
+
+            new_record = await self._task_mgr.submit(
+                prompt=instruction,
+                cwd=effective_cwd,
+                model=model,
+                effort=effort,
+                max_turns=max_turns,
+                resume_session_id=target_sid,
+            )
+            payload: dict[str, Any] = {
+                "task_id": new_record.task_id,
+                "status": new_record.status.value,
+                "session_id": target_sid,
+                "message": (
+                    "追加指令已提交，将在同一会话中继续。"
+                    "建议调用 claude_code_wait 等待执行结果。"
+                ),
+            }
+            if interrupted:
+                payload["interrupted_task_id"] = tid
+                payload["message"] = (
+                    f"已中断原任务 {tid}，纠正指令将在同一会话 {target_sid} 中续发。"
+                    "建议调用 claude_code_wait 等待执行结果。"
+                )
+            return Ok(payload)
+        except Exception as e:
+            self.logger.exception("claude_code_followup failed")
+            return Err(SdkError(f"追加指令失败: {e}"))
 
     @llm_tool(
         name="claude_code_check_health",

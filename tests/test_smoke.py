@@ -587,5 +587,143 @@ def test_resolve_resume_uuid_locates_project_dir(tmp_path):
         cs.claude_projects_root = orig_root
 
 
+def test_followup_interrupt_and_resume(tmp_path):
+    """测试执行中追加纠正指令：中断运行中任务→同会话续发；按 UUID 续发。"""
+    import asyncio
+    import json
+    from unittest.mock import MagicMock
+
+    models = _load_pkg_module("models.py", "models")
+    _load_pkg_module("errors.py", "errors")
+    _load_pkg_module("parser.py", "parser")
+    _load_pkg_module("executor.py", "executor")
+    tm = _load_pkg_module("task_manager.py", "task_manager")
+    pm = _load_pkg_module("_plugin_main.py", "_plugin_main")
+    cs = pm.claude_sessions
+
+    class _FakeStream:
+        def __init__(self, session_id: str):
+            self.session_id = session_id
+            self.messages = []
+            self.final_text = "已按纠正指令继续"
+            self.result = None
+
+    class _GateExecutor:
+        """首次调用：先吐 init 事件（早期捕获 session_id）再阻塞等待中断；
+        后续调用：立即成功返回。"""
+
+        def __init__(self):
+            self.calls = []
+            self.gate = asyncio.Event()
+
+        async def execute(self, invocation, parser):
+            self.calls.append(invocation)
+            if len(self.calls) == 1:
+                parser.parse_line(
+                    json.dumps(
+                        {
+                            "type": "system",
+                            "subtype": "init",
+                            "session_id": "sess-live",
+                            "cwd": "D:\\demo",
+                        }
+                    ).encode("utf-8")
+                )
+                await self.gate.wait()  # 阻塞直到被 cancel
+                return _FakeStream("sess-live"), None
+            return _FakeStream("sess-live"), None
+
+    # 构造历史会话存档（供 session_id 路径定位归属目录）
+    hist_uuid = "aaaa1111-2222-3333-4444-555566667777"
+    proj = tmp_path / ".claude" / "projects" / "-D-proj-hist"
+    proj.mkdir(parents=True)
+    (proj / f"{hist_uuid}.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "sessionId": hist_uuid,
+                "cwd": "D:\\proj\\hist",
+                "timestamp": "2026-08-12T10:00:03.000Z",
+                "message": {"role": "user", "content": "旧会话首条指令"},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    orig_root = cs.claude_projects_root
+    cs.claude_projects_root = lambda home=None: str(tmp_path / ".claude" / "projects")
+
+    try:
+
+        async def main():
+            config = models.AdapterConfig(command="fake-claude")
+            executor = _GateExecutor()
+            plugin = pm.ClaudeCodeAdapterPlugin(None)
+            plugin._ready = True
+            plugin._config = config
+            plugin._executor = MagicMock()
+            plugin._session_mgr = MagicMock()
+            plugin._provider_mgr = None
+            plugin._task_mgr = tm.TaskManager(executor, config)
+
+            # 1. 提交一个长任务，等待进入 RUNNING 且 session_id 已早期捕获
+            rec = await plugin._task_mgr.submit("实现功能", cwd="D:\\demo")
+            for _ in range(200):
+                if rec.status == tm.TaskStatus.RUNNING and rec.session_id:
+                    break
+                await asyncio.sleep(0.02)
+            assert rec.session_id == "sess-live", "init 事件应被早期捕获"
+
+            # 2. followup(task_id)：中断跑偏任务 → 同一会话续发
+            out = await plugin.claude_code_followup(
+                instruction="方向不对，改回方案 A", task_id=rec.task_id
+            )
+            assert isinstance(out, dict), out
+            assert out["session_id"] == "sess-live"
+            assert out.get("interrupted_task_id") == rec.task_id
+            assert rec.status == tm.TaskStatus.CANCELLED
+            executor.gate.set()  # 释放原任务协程退出
+            await asyncio.sleep(0.05)
+
+            res = await plugin._task_mgr.wait_for(
+                out["task_id"], max_wait_sec=5.0, interval_sec=0.1
+            )
+            assert res["status"] == "done", res
+            # 续发必须带 --resume 同一 UUID
+            assert "--resume" in executor.calls[1].cmd
+            assert "sess-live" in executor.calls[1].cmd
+            assert executor.calls[1].cmd[-1] != "--resume"
+
+            # 3. followup(session_id)：命令形态 UUID → 定位归属目录续发
+            out2 = await plugin.claude_code_followup(
+                instruction="继续修 bug",
+                session_id=f"claude --resume {hist_uuid.upper()}",
+            )
+            assert isinstance(out2, dict), out2
+            assert out2["session_id"] == hist_uuid
+            res2 = await plugin._task_mgr.wait_for(
+                out2["task_id"], max_wait_sec=5.0, interval_sec=0.1
+            )
+            assert res2["status"] == "done", res2
+            assert executor.calls[2].cwd == "D:\\proj\\hist", "应自动切到会话归属目录"
+            assert hist_uuid in executor.calls[2].cmd
+
+            # 4. 既不给 task_id 也不给 session_id → 报错
+            err = await plugin.claude_code_followup(instruction="x")
+            assert isinstance(err, Exception)
+            # instruction 为空 → 报错
+            err2 = await plugin.claude_code_followup(
+                instruction="", task_id=rec.task_id
+            )
+            assert isinstance(err2, Exception)
+            # 未知 task_id → 报错
+            err3 = await plugin.claude_code_followup(instruction="x", task_id="nope")
+            assert isinstance(err3, Exception)
+
+        asyncio.run(main())
+    finally:
+        cs.claude_projects_root = orig_root
+
+
 if __name__ == "__main__":
     subprocess.run([sys.executable, "-m", "pytest", __file__, "-v"])

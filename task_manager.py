@@ -201,6 +201,10 @@ class TaskManager:
                 return {"error": f"Task not found: {task_id}"}
             return record.to_dict()
 
+    def get_record(self, task_id: str) -> Optional[TaskRecord]:
+        """返回任务记录对象（不存在时返回 None）。供插件主类编排用。"""
+        return self._tasks.get(task_id)
+
     async def wait_for(
         self,
         task_id: str,
@@ -351,7 +355,13 @@ class TaskManager:
         if build_err:
             raise RuntimeError(f"Failed to build CLI invocation: {build_err}")
 
-        parser = ClaudeOutputParser()
+        # session_id 早期捕获：init 事件到达时立即写入 record，
+        # 使任务执行中途也能感知会话 UUID（供中断后同会话续发）
+        def _capture_session_id(sid: str) -> None:
+            if sid:
+                record.session_id = sid
+
+        parser = ClaudeOutputParser(on_session_id=_capture_session_id)
         stream, exec_err = await self._executor.execute(invocation, parser)
 
         # 捕获会话 ID（无论成败，供续跑和 UI 展示）

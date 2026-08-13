@@ -41,6 +41,7 @@ npm install -g @anthropic-ai/claude-code
 | 接着上次继续（默认） | 「继续刚才的项目改一下 xxx」 | `session_mode=auto`，自动复用同目录会话 |
 | 强制开新会话 | 「开个新会话来做这个」 | `session_mode=new` |
 | 接回任意历史会话 | 「继续这个会话：`<UUID>`」 | `session_mode=resume` + `session_id`，插件自动定位会话归属目录，无需指定路径 |
+| 执行中纠正/追加指令 | 「让 Claude Code 改一下：xxx」 | `claude_code_followup`：任务运行中先中断它，再在同一会话（同一 UUID）里续发纠正指令，已有上下文全部保留；任务已完成则直接续发 |
 
 会话 UUID 从哪来？三个渠道：
 1. 每次执行返回的 `session_id` 字段（维持同一会话直接把它传回去）；
@@ -136,8 +137,8 @@ ruff check . && ruff format --check .
 推送与 `plugin.toml` 版本匹配的标签以创建 GitHub Release 资源：
 
 ```bash
-git tag v0.4.0
-git push origin v0.4.0
+git tag v0.5.0
+git push origin v0.5.0
 ```
 
 `.github/workflows/release.yml` 会上传 `claude_code_adapter.neko-plugin`，在插件市场发布版本时使用该 GitHub Release URL。
@@ -149,6 +150,11 @@ entry = "plugins.claude_code_adapter:ClaudeCodeAdapterPlugin"
 ```
 
 ## 版本历史
+
+### v0.5.0 (2026-08-13)
+- 新增 `claude_code_followup`：任务执行中发现方向跑偏，可中断当前任务并在同一会话（同一 UUID）里追加纠正指令，已有上下文全部保留；已完成的会话也可直接续发补充指令
+- session_id 早期捕获：CLI init 事件到达时立即记录会话 UUID，任务执行中途也能感知，支持中断后同会话续发
+- 修复前端面板不可见：plugin.toml 补齐 `[plugin.ui]` + `[[plugin.ui.panel]]` 声明（此前缺少声明导致 cc-switch 风格会话面板不显示）
 
 ### v0.4.0 (2026-08-13)
 - 确立以 Claude Code 原生会话 UUID 作为会话主标识（与 cc-switch 会话管理中的 UUID 同源），维持/新开/回溯全部围绕它展开
