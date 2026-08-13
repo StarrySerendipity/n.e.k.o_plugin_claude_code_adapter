@@ -195,6 +195,9 @@ class ExecuteResult:
     session_id: str = ""
     """本次执行使用的会话 ID（可能是新创建或恢复的）。"""
 
+    session_title: str = ""
+    """会话标题（来自 Claude 存档的首条用户消息/自定义标题，resume 时填充）。"""
+
     is_new_session: bool = False
     """是否是新创建的会话（True）还是恢复的旧会话（False）。"""
 
@@ -241,7 +244,7 @@ class ExecuteResult:
                 "session_id": self.session_id,
                 "duration_ms": self.duration_ms,
             }
-        return {
+        payload = {
             "output": self.final_text,
             "is_error": False,
             "session_id": self.session_id,
@@ -251,6 +254,9 @@ class ExecuteResult:
             "duration_ms": self.duration_ms,
             "message_count": len(self.messages),
         }
+        if self.session_title:
+            payload["session_title"] = self.session_title
+        return payload
 
 
 # ---------------------------------------------------------------------------

@@ -34,15 +34,20 @@ npm install -g @anthropic-ai/claude-code
 
 ### 3. 会话控制（重点）
 
-Claude Code 的「会话」决定上下文是否延续。本插件提供三档明确的控制，猫娘不会再「想续会话却开了新会话」：
+每个 Claude Code 会话都有一个唯一 UUID（即工具返回的 `session_id`，与 cc-switch 会话管理里看到的是同一个）。本插件以它作为会话主标识，提供三档明确的控制，猫娘不会再「想续会话却开了新会话」：
 
 | 你想做什么 | 怎么跟猫娘说 | 背后行为 |
 |---|---|---|
 | 接着上次继续（默认） | 「继续刚才的项目改一下 xxx」 | `session_mode=auto`，自动复用同目录会话 |
 | 强制开新会话 | 「开个新会话来做这个」 | `session_mode=new` |
-| 接回指定的旧会话 | 「继续这个会话：`<UUID>`」 | `session_mode=resume` + `session_id` |
+| 接回任意历史会话 | 「继续这个会话：`<UUID>`」 | `session_mode=resume` + `session_id`，插件自动定位会话归属目录，无需指定路径 |
 
-会话 UUID 从哪来？打开插件面板的**会话管理**页，左侧列表点选会话，右侧标题栏有 UUID，点击即可复制。把 UUID 发给猫娘即可精确续跑。
+会话 UUID 从哪来？三个渠道：
+1. 每次执行返回的 `session_id` 字段（维持同一会话直接把它传回去）；
+2. 插件面板的**会话管理**页：左侧列表点选会话，右侧标题栏有 UUID，点击即可复制；
+3. 让猫娘调用 `claude_code_list_sessions(include_history=true)` 列出所有历史会话。
+
+resume 模式对 UUID 很宽容：完整 UUID、唯一前缀（如面板里截断显示的 `d7d17ec1-...`）、甚至整条 `claude --resume <uuid>` 命令都能识别。插件会从 `~/.claude/projects` 存档解析会话归属的项目目录并自动切换过去（Claude CLI 按目录索引会话，目录不对 `--resume` 必然失败）；若你显式传了不一致的 cwd，会报清晰错误提示。
 
 任务失败时插件会自动用 `session_id` 以 `--resume` 续跑而非重开新会话，尽量保留上下文。
 
@@ -76,7 +81,7 @@ Claude Code 的「会话」决定上下文是否延续。本插件提供三档�
 | `claude_code_poll` | 单次查询任务状态 |
 | `claude_code_cancel` | 取消任务 |
 | `claude_code_check_health` | 检查 CLI 是否可用、版本、配置 |
-| `claude_code_list_sessions` | 列出插件维护的可恢复会话索引 |
+| `claude_code_list_sessions` | 列出会话索引；`include_history=true` 时额外列出 `~/.claude/projects` 所有历史会话 UUID |
 | `claude_code_clear_session` | 清除会话索引（按目录或全部） |
 | `claude_code_get_config` | 查看当前适配器配置 |
 | `claude_code_list_providers` | 列出供应商 |
@@ -131,8 +136,8 @@ ruff check . && ruff format --check .
 推送与 `plugin.toml` 版本匹配的标签以创建 GitHub Release 资源：
 
 ```bash
-git tag v0.3.0
-git push origin v0.3.0
+git tag v0.4.0
+git push origin v0.4.0
 ```
 
 `.github/workflows/release.yml` 会上传 `claude_code_adapter.neko-plugin`，在插件市场发布版本时使用该 GitHub Release URL。
@@ -144,6 +149,14 @@ entry = "plugins.claude_code_adapter:ClaudeCodeAdapterPlugin"
 ```
 
 ## 版本历史
+
+### v0.4.0 (2026-08-13)
+- 确立以 Claude Code 原生会话 UUID 作为会话主标识（与 cc-switch 会话管理中的 UUID 同源），维持/新开/回溯全部围绕它展开
+- resume 模式增强：支持任意历史会话，自动从 `~/.claude/projects` 存档解析会话归属目录并切换 cwd（修复跨目录 `--resume` 必失败的问题）；cwd 与会话归属目录不一致时报清晰错误
+- UUID 宽容识别：裸 UUID、唯一前缀、`claude --resume <uuid>` 命令形态均可
+- `claude_code_list_sessions` 新增 `include_history` / `cwd` / `limit` 参数，可列出所有历史会话 UUID（含标题、resume_command）
+- 执行/提交结果新增 `session_title` / `resumed_session_title`，猫娘能说出「接回了哪个会话」
+- 面板读取/删除会话入口同步支持 UUID 规范化与前缀匹配
 
 ### v0.3.0 (2026-08-13)
 - 新增 `claude_code_wait` 智能等待工具：插件内部自适应退避轮询，任务完成立即返回，超时给出 `suggested_next_wait_sec` 续等建议

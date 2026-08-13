@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 from datetime import datetime
 from typing import Any, Optional
@@ -283,6 +284,71 @@ def scan_sessions(
     return sessions
 
 
+def normalize_session_ref(ref: str) -> str:
+    """规范化猫娘传来的会话引用为裸 UUID（小写、去修饰）。
+
+    兼容以下形态：
+    - 裸 UUID：``d7d17ec1-bd47-49f0-a845-dfa5df8c33a6``
+    - 命令形态：``claude --resume d7d17ec1-...``（面板复制出的完整命令）
+    - UUID 前缀：``d7d17ec1``（截断形态，由 find_session_by_id 做前缀匹配）
+    - 带引号/空白包裹
+    """
+    text = (ref or "").strip().strip("'\"")
+    # 取最后一个空白分隔的 token（兼容 "claude --resume <uuid>"）
+    tokens = [t for t in text.split() if t]
+    if tokens:
+        candidate = tokens[-1].strip("'\"")
+        # 仅当 token 看起来像 UUID/前缀时才采用，否则保留原文
+        if re.fullmatch(r"[0-9a-fA-F-]{4,}", candidate):
+            text = candidate
+    return text.lower()
+
+
+def find_session_by_id(
+    session_id: str,
+    *,
+    home: Optional[str] = None,
+    limit: int = DEFAULT_SCAN_LIMIT,
+) -> Optional[dict[str, Any]]:
+    """按 UUID（或唯一前缀）在 ``~/.claude/projects`` 中定位历史会话。
+
+    优先精确匹配 jsonl 文件名（``<uuid>.jsonl``），失败时回退到
+    唯一前缀匹配（多个匹配返回 None，避免歧义）。
+    返回结构与 ``scan_sessions`` 的单条会话一致（含 project_dir）。
+    """
+    sid = normalize_session_ref(session_id)
+    if not sid:
+        return None
+    root = claude_projects_root(home)
+    files: list[str] = []
+    _collect_jsonl_files(root, files)
+
+    # 精确匹配：文件名 stem == uuid
+    for path in files:
+        if _is_agent_session(path):
+            continue
+        if os.path.splitext(os.path.basename(path))[0].lower() == sid:
+            return _parse_session(path)
+
+    # 前缀匹配：要求唯一
+    if len(sid) >= 8:
+        matches = [
+            p
+            for p in files
+            if not _is_agent_session(p)
+            and os.path.splitext(os.path.basename(p))[0].lower().startswith(sid)
+        ]
+        if len(matches) == 1:
+            return _parse_session(matches[0])
+
+    if limit > 0:
+        # 兜底：解析文件内容里的 sessionId（文件名与内容不一致时）
+        for meta in scan_sessions(home=home, limit=limit):
+            if meta["session_id"].lower() == sid:
+                return meta
+    return None
+
+
 def load_messages(
     source_path: str,
     *,
@@ -350,7 +416,11 @@ def load_messages(
     except OSError:
         return []
 
-    if expected_session_id and seen_session_id and seen_session_id != expected_session_id:
+    if (
+        expected_session_id
+        and seen_session_id
+        and seen_session_id != expected_session_id
+    ):
         return []
 
     if max_messages > 0 and len(messages) > max_messages:
@@ -384,6 +454,8 @@ def delete_session(source_path: str, session_id: str) -> bool:
 __all__ = [
     "claude_projects_root",
     "scan_sessions",
+    "normalize_session_ref",
+    "find_session_by_id",
     "load_messages",
     "delete_session",
 ]

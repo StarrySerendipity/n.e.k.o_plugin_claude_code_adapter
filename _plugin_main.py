@@ -13,9 +13,13 @@
 - claude_code_list_providers / claude_code_switch_provider /
   claude_code_remove_provider: cc-switch 风格的多供应商切换
 
-会话控制（v0.3.0）：
+会话控制（v0.4.0）：
 execute / submit 支持 session_mode（auto/new/resume）+ session_id，
 让猫娘能明确指定续跑同一会话或强制新开会话。
+session_id 就是 Claude Code 原生会话 UUID（每个 Claude Code 会话唯一）：
+- resume 模式支持裸 UUID、唯一前缀、'claude --resume <uuid>' 命令形态，
+  并自动从 ~/.claude/projects 存档解析会话归属目录（Claude CLI 按 cwd
+  索引会话，目录不对 --resume 必然失败），可随时回到任意历史会话。
 """
 
 from __future__ import annotations
@@ -199,37 +203,90 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
         session_id: str,
         cwd: str,
         signature: str,
-    ) -> tuple[str, str]:
-        """根据会话模式解析要续跑的会话 ID。
+    ) -> tuple[str, str, str, str]:
+        """根据会话模式解析要续跑的会话。
 
         Returns:
-            (resume_id, error_message)。error_message 非空时调用方应直接返回。
+            (resume_id, resolved_cwd, session_title, error_message)。
+            error_message 非空时调用方应直接返回。
 
         - auto: 自动查找可恢复会话（cwd + 提示包签名匹配）
         - new:  强制新开会话（resume_id = ""）
-        - resume: 必须提供 session_id，强制续跑指定会话
+        - resume: 按 Claude Code 原生会话 UUID 强制续跑：
+          * session_id 支持裸 UUID、``claude --resume <uuid>`` 命令形态、
+            唯一 UUID 前缀（面板复制出的截断形态）
+          * 自动从 ``~/.claude/projects`` 存档解析会话归属的项目目录。
+            Claude CLI 按工作目录索引会话，cwd 不匹配时 --resume 会失败，
+            因此调用方不传 cwd 时自动采用会话归属目录。
         """
         assert self._session_mgr is not None
         mode = (session_mode or "auto").strip().lower() or "auto"
 
         if mode not in ("auto", "new", "resume"):
-            return "", (
-                f"无效的 session_mode: {session_mode!r}，"
-                "只支持 'auto' / 'new' / 'resume'。"
+            return (
+                "",
+                "",
+                "",
+                (
+                    f"无效的 session_mode: {session_mode!r}，"
+                    "只支持 'auto' / 'new' / 'resume'。"
+                ),
             )
         if mode == "new":
-            return "", ""
+            return "", "", "", ""
         if mode == "resume":
-            sid = (session_id or "").strip()
-            if not sid:
-                return "", (
-                    "session_mode='resume' 需要同时提供 session_id。"
-                    "可先用 claude_code_list_sessions 查看可用会话。"
+            ref = claude_sessions.normalize_session_ref(session_id)
+            if not ref:
+                return (
+                    "",
+                    "",
+                    "",
+                    (
+                        "session_mode='resume' 需要同时提供 session_id（Claude Code 会话 UUID）。"
+                        "可用 claude_code_list_sessions(include_history=true) 或插件面板查看可用会话。"
+                    ),
                 )
-            return sid, ""
+            try:
+                meta = claude_sessions.find_session_by_id(ref)
+            except Exception as e:
+                self.logger.warning("find_session_by_id failed: {}", e)
+                meta = None
+            if meta is None:
+                return (
+                    "",
+                    "",
+                    "",
+                    (
+                        f"未找到 session_id={session_id!r} 对应的 Claude Code 会话。"
+                        "请检查 UUID 是否正确（可用 claude_code_list_sessions(include_history=true) "
+                        "或插件面板查看历史会话 UUID）。"
+                    ),
+                )
+            full_id = str(meta.get("session_id") or ref)
+            project_dir = str(meta.get("project_dir") or "")
+            title = str(meta.get("title") or "")
+            explicit_cwd = (cwd or "").strip()
+            if explicit_cwd and project_dir:
+                # Claude CLI 的 --resume 只在当前目录的会话索引里查找，
+                # cwd 与会话归属目录不一致时必然失败 — 提前报清晰错误
+                if os.path.normcase(os.path.normpath(explicit_cwd)) != os.path.normcase(
+                    os.path.normpath(project_dir)
+                ):
+                    return (
+                        "",
+                        "",
+                        "",
+                        (
+                            f"会话 {full_id} 归属目录为 {project_dir!r}，"
+                            f"与传入的 cwd={explicit_cwd!r} 不一致。"
+                            "请去掉 cwd 参数（自动采用会话归属目录），或传入正确的目录。"
+                        ),
+                    )
+            return full_id, project_dir, title, ""
         # auto
-        record = await self._session_mgr.find_resumable(cwd, signature)
-        return (record.session_id if record else ""), ""
+        lookup_cwd = (cwd or "").strip() or self._config.cwd or os.getcwd()
+        record = await self._session_mgr.find_resumable(lookup_cwd, signature)
+        return (record.session_id if record else ""), "", "", ""
 
     # ------------------------------------------------------------------
     # 核心执行逻辑（内部方法，被 @llm_tool 方法调用）
@@ -257,17 +314,22 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
         """
         assert self._executor is not None and self._session_mgr is not None
 
-        effective_cwd = cwd or self._config.cwd or os.getcwd()
         signature = compute_prompt_signature(
             system_prompt_file=self._config.append_system_prompt_file,
             skills_dir=self._config.skills_dir,
         )
 
-        # 根据会话模式解析续跑会话
-        resume_id, resolve_err = await self._resolve_resume_id(
+        # 根据会话模式解析续跑会话（resume 模式返回会话归属目录）
+        requested_cwd = (cwd or "").strip()
+        (
+            resume_id,
+            resume_cwd,
+            resume_title,
+            resolve_err,
+        ) = await self._resolve_resume_id(
             session_mode=session_mode,
             session_id=session_id,
-            cwd=effective_cwd,
+            cwd=requested_cwd,
             signature=signature,
         )
         if resolve_err:
@@ -275,6 +337,8 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
                 error_kind="invalid_argument",
                 error_message=resolve_err,
             )
+        # 工作目录优先级：调用方显式指定 > 会话归属目录(resume) > 配置默认 > 进程 cwd
+        effective_cwd = requested_cwd or resume_cwd or self._config.cwd or os.getcwd()
         mode = (session_mode or "auto").strip().lower() or "auto"
 
         max_attempts = 1 + max(0, self._config.max_retries)
@@ -338,6 +402,7 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
                 # 构造结果
                 result = ExecuteResult(
                     session_id=session_id,
+                    session_title=resume_title if resume_id else "",
                     is_new_session=is_new_session,
                     messages=stream.messages,
                     final_text=stream.final_text,
@@ -402,8 +467,11 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
             "- max_turns: 最大轮次（可选，0=使用默认值）。\n"
             "- session_mode: 会话控制（可选）：'auto'（默认，自动复用同目录会话）/ "
             "'new'（强制新开会话）/ 'resume'（强制续跑 session_id 指定的会话）。\n"
-            "- session_id: 仅 session_mode='resume' 时需要，指定要续跑的会话 ID。\n\n"
-            "返回：包含 Claude Code 的最终回复文本、会话 ID、费用、轮次等信息的字典。"
+            "- session_id: 仅 session_mode='resume' 时需要。它就是 Claude Code 原生会话 UUID，"
+            "可从本工具/submit 返回的 session_id 字段、claude_code_list_sessions(include_history=true) "
+            "或插件面板获取；支持任意历史会话，插件会自动定位会话归属目录，无需同时传 cwd。\n\n"
+            "返回：包含 Claude Code 的最终回复文本、会话 ID（session_id，即 Claude Code 原生 UUID，"
+            "后续维持同一会话直接传它）、费用、轮次等信息的字典。"
         ),
         parameters={
             "type": "object",
@@ -433,13 +501,17 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
                     "type": "string",
                     "description": (
                         "会话控制：'auto'（默认，自动复用）/ 'new'（强制新会话）/ "
-                        "'resume'（续跑 session_id 指定的会话）。"
+                        "'resume'（续跑 session_id 指定的会话，支持任意历史会话）。"
                     ),
                     "enum": ["", "auto", "new", "resume"],
                 },
                 "session_id": {
                     "type": "string",
-                    "description": "仅 session_mode='resume' 时需要：要续跑的会话 ID。",
+                    "description": (
+                        "仅 session_mode='resume' 时需要：Claude Code 原生会话 UUID。"
+                        "取自之前执行返回的 session_id、claude_code_list_sessions(include_history=true) "
+                        "或插件面板；支持完整 UUID、唯一前缀或 'claude --resume <uuid>' 命令形态。"
+                    ),
                 },
             },
             "required": ["prompt"],
@@ -528,13 +600,17 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
                     "type": "string",
                     "description": (
                         "会话控制：'auto'（默认，自动复用）/ 'new'（强制新会话）/ "
-                        "'resume'（续跑 session_id 指定的会话）。"
+                        "'resume'（续跑 session_id 指定的会话，支持任意历史会话）。"
                     ),
                     "enum": ["", "auto", "new", "resume"],
                 },
                 "session_id": {
                     "type": "string",
-                    "description": "仅 session_mode='resume' 时需要：要续跑的会话 ID。",
+                    "description": (
+                        "仅 session_mode='resume' 时需要：Claude Code 原生会话 UUID。"
+                        "取自之前执行返回的 session_id、claude_code_list_sessions(include_history=true) "
+                        "或插件面板；支持完整 UUID、唯一前缀或 'claude --resume <uuid>' 命令形态。"
+                    ),
                 },
             },
             "required": ["prompt"],
@@ -566,37 +642,47 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
         try:
             assert self._session_mgr is not None
             # 提交时一次性解析续跑会话（TaskManager 不依赖 SessionManager）
-            effective_cwd = cwd or self._config.cwd or os.getcwd()
+            requested_cwd = (cwd or "").strip()
             signature = compute_prompt_signature(
                 system_prompt_file=self._config.append_system_prompt_file,
                 skills_dir=self._config.skills_dir,
             )
-            resume_id, resolve_err = await self._resolve_resume_id(
+            (
+                resume_id,
+                resume_cwd,
+                resume_title,
+                resolve_err,
+            ) = await self._resolve_resume_id(
                 session_mode=session_mode,
                 session_id=session_id,
-                cwd=effective_cwd,
+                cwd=requested_cwd,
                 signature=signature,
             )
             if resolve_err:
                 return Err(SdkError(resolve_err))
+            # 工作目录优先级：调用方显式指定 > 会话归属目录(resume) > 配置默认 > 进程 cwd
+            effective_cwd = (
+                requested_cwd or resume_cwd or self._config.cwd or os.getcwd()
+            )
 
             record = await self._task_mgr.submit(
                 prompt=prompt,
-                cwd=cwd,
+                cwd=effective_cwd,
                 model=model,
                 effort=effort,
                 max_turns=max_turns,
                 resume_session_id=resume_id,
             )
-            return Ok(
-                {
-                    "task_id": record.task_id,
-                    "status": record.status.value,
-                    "resumed_session": resume_id,
-                    "message": "任务已提交。建议根据预估耗时调用 claude_code_wait 等待结果，"
-                    "或用 claude_code_poll 单次查询。",
-                }
-            )
+            payload: dict[str, Any] = {
+                "task_id": record.task_id,
+                "status": record.status.value,
+                "resumed_session": resume_id,
+                "message": "任务已提交。建议根据预估耗时调用 claude_code_wait 等待结果，"
+                "或用 claude_code_poll 单次查询。",
+            }
+            if resume_title:
+                payload["resumed_session_title"] = resume_title
+            return Ok(payload)
         except Exception as e:
             self.logger.exception("claude_code_submit failed")
             return Err(SdkError(f"提交任务失败: {e}"))
@@ -835,32 +921,105 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
     @llm_tool(
         name="claude_code_list_sessions",
         description=(
-            "列出所有 Claude Code 会话记录。会话按最近使用时间降序排列。\n\n"
+            "列出 Claude Code 会话记录。默认列出插件维护的活跃会话索引；"
+            "include_history=true 时额外扫描 ~/.claude/projects 原生存档，"
+            "列出所有历史会话（含 session_id/标题/归属目录/最近活跃时间）。\n\n"
             "适用场景：\n"
             "- 查看当前有哪些活跃的 Claude Code 会话\n"
-            "- 了解每个会话的工作目录、轮次数、最后错误\n"
-            "- 决定是否需要清除某个会话\n\n"
-            "返回：包含 sessions 列表的字典，每个会话含 session_id、cwd、turn_count 等字段。"
+            "- include_history=true：找回历史会话的 UUID，配合 "
+            "claude_code_execute(session_mode='resume', session_id=<UUID>) 回到该会话的上下文\n\n"
+            "返回：包含 sessions 列表的字典，每个会话含 session_id（Claude Code 原生 UUID）、"
+            "cwd、turn_count 等字段；历史会话额外含 title、resume_command。"
         ),
         parameters={
             "type": "object",
-            "properties": {},
+            "properties": {
+                "include_history": {
+                    "type": "boolean",
+                    "description": (
+                        "是否同时列出 ~/.claude/projects 中的所有历史会话（默认 false）。"
+                        "需要找回旧会话 UUID 续跑时设为 true。"
+                    ),
+                },
+                "cwd": {
+                    "type": "string",
+                    "description": "可选：只列出归属该工作目录的会话。",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "历史会话最多返回条数（可选，默认 50，仅 include_history=true 时生效）。",
+                },
+            },
         },
-        timeout=10.0,
+        timeout=30.0,
     )
-    async def claude_code_list_sessions(self, **_) -> dict[str, Any]:
-        """列出所有会话。"""
+    async def claude_code_list_sessions(
+        self,
+        include_history: bool = False,
+        cwd: str = "",
+        limit: int = 50,
+        **_,
+    ) -> dict[str, Any]:
+        """列出会话（可选含历史会话）。"""
         not_ready = self._ensure_ready()
         if not_ready is not None:
             return not_ready
 
         try:
             assert self._session_mgr is not None
+            cwd_filter = os.path.normcase(os.path.normpath(cwd)) if cwd.strip() else ""
+
             records = await self._session_mgr.list_all()
+            sessions: list[dict[str, Any]] = []
+            seen_ids: set[str] = set()
+            for r in records:
+                if (
+                    cwd_filter
+                    and os.path.normcase(os.path.normpath(r.cwd)) != cwd_filter
+                ):
+                    continue
+                item = r.to_dict()
+                item["source"] = "active"
+                sessions.append(item)
+                if r.session_id:
+                    seen_ids.add(r.session_id.lower())
+
+            history_count = 0
+            if include_history:
+                max_history = max(1, int(limit or 50))
+                for meta in claude_sessions.scan_sessions(limit=0):
+                    sid = str(meta.get("session_id") or "")
+                    project_dir = str(meta.get("project_dir") or "")
+                    if cwd_filter:
+                        if (
+                            not project_dir
+                            or os.path.normcase(os.path.normpath(project_dir))
+                            != cwd_filter
+                        ):
+                            continue
+                    if sid.lower() in seen_ids:
+                        continue
+                    seen_ids.add(sid.lower())
+                    sessions.append(
+                        {
+                            "source": "history",
+                            "session_id": sid,
+                            "title": meta.get("title", ""),
+                            "cwd": project_dir,
+                            "created_at": meta.get("created_at"),
+                            "last_used_at": meta.get("last_active_at"),
+                            "resume_command": meta.get("resume_command", ""),
+                        }
+                    )
+                    history_count += 1
+                    if history_count >= max_history:
+                        break
+
             return Ok(
                 {
-                    "count": len(records),
-                    "sessions": [r.to_dict() for r in records],
+                    "count": len(sessions),
+                    "history_count": history_count,
+                    "sessions": sessions,
                 }
             )
         except Exception as e:
@@ -1268,24 +1427,22 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
         if not sid:
             return Err(SdkError("session_id 不能为空"))
         try:
-            # 先定位会话文件
-            target = None
-            for meta in claude_sessions.scan_sessions(limit=0):
-                if meta["session_id"] == sid:
-                    target = meta
-                    break
+            # 定位会话文件（支持完整 UUID / 唯一前缀 / 命令形态）
+            target = claude_sessions.find_session_by_id(sid)
             if target is None:
                 return Err(SdkError(f"会话不存在: {sid}"))
+            full_id = str(target.get("session_id") or sid)
             messages = claude_sessions.load_messages(
-                target["source_path"], expected_session_id=sid
+                target["source_path"], expected_session_id=full_id
             )
             return Ok(
                 {
-                    "session_id": sid,
+                    "session_id": full_id,
                     "title": target["title"],
                     "project_dir": target["project_dir"],
                     "created_at": target["created_at"],
                     "last_active_at": target["last_active_at"],
+                    "resume_command": target.get("resume_command", ""),
                     "message_count": len(messages),
                     "messages": messages,
                 }
@@ -1315,18 +1472,15 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
         if not sid:
             return Err(SdkError("session_id 不能为空"))
         try:
-            target = None
-            for meta in claude_sessions.scan_sessions(limit=0):
-                if meta["session_id"] == sid:
-                    target = meta
-                    break
+            target = claude_sessions.find_session_by_id(sid)
             if target is None:
                 return Err(SdkError(f"会话不存在: {sid}"))
-            deleted = claude_sessions.delete_session(target["source_path"], sid)
+            full_id = str(target.get("session_id") or sid)
+            deleted = claude_sessions.delete_session(target["source_path"], full_id)
             if not deleted:
-                return Err(SdkError(f"删除失败（ID 不匹配或文件占用）: {sid}"))
-            self.logger.info("Deleted Claude session: {}", sid)
-            return Ok({"deleted": True, "session_id": sid})
+                return Err(SdkError(f"删除失败（ID 不匹配或文件占用）: {full_id}"))
+            self.logger.info("Deleted Claude session: {}", full_id)
+            return Ok({"deleted": True, "session_id": full_id})
         except Exception as e:
             self.logger.exception("delete_claude_session_entry failed")
             return Err(SdkError(f"删除会话失败: {e}"))

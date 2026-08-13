@@ -244,6 +244,8 @@ def test_claude_sessions_importable():
     assert hasattr(mod, "load_messages")
     assert hasattr(mod, "delete_session")
     assert hasattr(mod, "claude_projects_root")
+    assert hasattr(mod, "normalize_session_ref")
+    assert hasattr(mod, "find_session_by_id")
 
 
 def test_claude_sessions_scan_load_delete(tmp_path):
@@ -280,7 +282,10 @@ def test_claude_sessions_scan_load_delete(tmp_path):
             "type": "user",
             "sessionId": "sess-001",
             "timestamp": "2026-08-12T10:00:02.000Z",
-            "message": {"role": "user", "content": "<command-name>/clear</command-name>"},
+            "message": {
+                "role": "user",
+                "content": "<command-name>/clear</command-name>",
+            },
         },
         # 首条真实用户消息
         {
@@ -430,6 +435,156 @@ def test_task_manager_wait_and_resume():
         assert "建议" in out["message"]
 
     asyncio.run(main())
+
+
+def test_uuid_normalize_and_find(tmp_path):
+    """测试 UUID 规范化（命令形态/大小写/前缀）与存档定位。"""
+    import json
+
+    mod = _load_pkg_module("claude_sessions.py", "claude_sessions_t3")
+
+    uuid = "d7d17ec1-bd47-49f0-a845-dfa5df8c33a6"
+
+    # 规范化：命令形态 / 大写 / 引号包裹
+    assert mod.normalize_session_ref(f"claude --resume {uuid.upper()}") == uuid
+    assert mod.normalize_session_ref(f"  '{uuid}' ") == uuid
+    assert mod.normalize_session_ref("") == ""
+
+    # 构造存档：<uuid>.jsonl 归属 D:\proj\demo
+    proj = tmp_path / ".claude" / "projects" / "-D-proj-demo"
+    proj.mkdir(parents=True)
+    (proj / f"{uuid}.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "sessionId": uuid,
+                "cwd": "D:\\proj\\demo",
+                "timestamp": "2026-08-12T10:00:03.000Z",
+                "message": {"role": "user", "content": "修复登录表单校验"},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    # 精确匹配（大写也可）
+    meta = mod.find_session_by_id(uuid.upper(), home=str(tmp_path))
+    assert meta is not None
+    assert meta["session_id"] == uuid
+    assert meta["project_dir"] == "D:\\proj\\demo"
+
+    # 前缀匹配（面板截断形态）与命令形态
+    meta2 = mod.find_session_by_id("d7d17ec1", home=str(tmp_path))
+    assert meta2 is not None and meta2["session_id"] == uuid
+    meta3 = mod.find_session_by_id(f"claude --resume {uuid}", home=str(tmp_path))
+    assert meta3 is not None and meta3["session_id"] == uuid
+
+    # 不存在 → None
+    assert (
+        mod.find_session_by_id(
+            "ffffffff-0000-0000-0000-000000000000", home=str(tmp_path)
+        )
+        is None
+    )
+
+
+def test_resolve_resume_uuid_locates_project_dir(tmp_path):
+    """测试 resume 模式：自动定位会话归属目录、cwd 冲突报错、宽容 UUID。"""
+    import asyncio
+    import json
+
+    models = _load_pkg_module("models.py", "models")
+    pm = _load_pkg_module("_plugin_main.py", "_plugin_main")
+    cs = pm.claude_sessions
+
+    uuid = "d7d17ec1-bd47-49f0-a845-dfa5df8c33a6"
+    proj = tmp_path / ".claude" / "projects" / "-D-proj-demo"
+    proj.mkdir(parents=True)
+    (proj / f"{uuid}.jsonl").write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "sessionId": uuid,
+                "cwd": "D:\\proj\\demo",
+                "timestamp": "2026-08-12T10:00:03.000Z",
+                "message": {"role": "user", "content": "修复登录表单校验"},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    # 将存档根指向临时目录
+    orig_root = cs.claude_projects_root
+    cs.claude_projects_root = lambda home=None: str(tmp_path / ".claude" / "projects")
+
+    class _FakeMgr:
+        async def find_resumable(self, cwd, signature):
+            return None
+
+    try:
+        p = pm.ClaudeCodeAdapterPlugin(None)
+        p._config = models.AdapterConfig()
+        p._session_mgr = _FakeMgr()
+
+        async def main():
+            # 命令形态 UUID + 不传 cwd → 自动采用会话归属目录
+            rid, rcwd, title, err = await p._resolve_resume_id(
+                session_mode="resume",
+                session_id=f"claude --resume {uuid}",
+                cwd="",
+                signature="sig",
+            )
+            assert err == ""
+            assert rid == uuid
+            assert rcwd == "D:\\proj\\demo"
+            assert "登录表单" in title
+
+            # 显式传不一致的 cwd → 清晰报错
+            _, _, _, err2 = await p._resolve_resume_id(
+                session_mode="resume",
+                session_id=uuid,
+                cwd="D:\\other\\dir",
+                signature="sig",
+            )
+            assert "归属目录" in err2
+
+            # 显式传一致的 cwd → 通过
+            rid3, _, _, err3 = await p._resolve_resume_id(
+                session_mode="resume",
+                session_id=uuid,
+                cwd="D:\\proj\\demo",
+                signature="sig",
+            )
+            assert err3 == "" and rid3 == uuid
+
+            # 未知 UUID → 报错并提示查看历史会话
+            _, _, _, err4 = await p._resolve_resume_id(
+                session_mode="resume",
+                session_id="ffffffff-0000-0000-0000-000000000000",
+                cwd="",
+                signature="sig",
+            )
+            assert "未找到" in err4
+
+            # resume 缺 session_id → 报错
+            _, _, _, err5 = await p._resolve_resume_id(
+                session_mode="resume", session_id="", cwd="", signature="sig"
+            )
+            assert err5
+
+            # new / 非法模式
+            assert await p._resolve_resume_id(
+                session_mode="new", session_id="", cwd="", signature="sig"
+            ) == ("", "", "", "")
+            _, _, _, err6 = await p._resolve_resume_id(
+                session_mode="weird", session_id="", cwd="", signature="sig"
+            )
+            assert "session_mode" in err6
+
+        asyncio.run(main())
+    finally:
+        cs.claude_projects_root = orig_root
 
 
 if __name__ == "__main__":

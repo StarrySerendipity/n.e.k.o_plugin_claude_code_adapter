@@ -8,6 +8,16 @@ import sys
 from unittest.mock import MagicMock
 
 
+class _FakeNekoPluginBase:
+    """轻量基类替身：支持子类任意属性访问与文件日志开启。"""
+
+    def __init__(self, ctx=None, **_kwargs) -> None:
+        self.ctx = ctx
+
+    def enable_file_logging(self, log_level: str = "INFO"):
+        return MagicMock()
+
+
 def _setup_sdk_mocks():
     """Mock N.E.K.O SDK modules before plugin import."""
     if "plugin" in sys.modules:
@@ -19,7 +29,7 @@ def _setup_sdk_mocks():
     mock_plugin_module = MagicMock()
 
     # Mock classes and functions that __init__.py imports
-    mock_plugin_module.NekoPluginBase = MagicMock
+    mock_plugin_module.NekoPluginBase = _FakeNekoPluginBase
     mock_plugin_module.neko_plugin = lambda x: x
     mock_plugin_module.plugin_entry = lambda **kwargs: lambda x: x
     mock_plugin_module.lifecycle = lambda **kwargs: lambda x: x
