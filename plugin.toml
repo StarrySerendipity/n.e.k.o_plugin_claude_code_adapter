@@ -1,8 +1,24 @@
 [plugin]
 name = "Claude Code Adapter"
 type = "plugin"
-description = "通过 @llm_tool 将 Claude Code CLI 注册为猫娘可调用的工具集。猫娘可以直接调用 Claude Code 执行项目开发任务：写代码、改 bug、跑测试、查文档。支持会话恢复、技能注入、流式输出解析和错误自动恢复。"
-short_description = "Expose Claude Code CLI as catgirl-callable LLM tools. Run Claude Code tasks from the main project."
+description = """让猫娘指挥 Claude Code 干活的适配器插件。
+
+【快速上手：怎么和猫娘说】
+- 短任务（<5分钟）：直接说「用 Claude Code 帮我把 xxx 项目的 xxx 功能实现一下」，猫娘会调用 claude_code_execute 同步执行并直接回复结果。
+- 长任务：说「提交一个 Claude Code 后台任务去做 xxx」，猫娘会 submit 后自行预估耗时，用 claude_code_wait 智能等待，完成后主动汇报。
+- 会话控制：同一项目的多轮迭代默认自动续跑同一会话；想强制新开就说「开个新会话来做」；想接回某个旧会话，把插件面板里看到的会话 UUID 发给猫娘，说「继续这个会话：<UUID>」。
+- 供应商切换：说「切换 Claude 供应商到 xxx」即可在官方/中转/第三方端点间切换（cc-switch 风格，仅注入子进程环境变量，不改全局配置）。
+
+【工具集】
+- claude_code_execute：同步执行（上限 300s）
+- claude_code_submit / claude_code_wait / claude_code_poll / claude_code_cancel：异步任务（submit 提交 → wait 智能等待，任务一完成立即返回；超时按 suggested_next_wait_sec 续等）
+- claude_code_list_sessions / clear_session / check_health / get_config：会话与环境管理
+- claude_code_list_providers / switch_provider / remove_provider：多供应商切换
+
+【前端面板】内置 cc-switch 风格的会话管理界面：左侧会话列表、右侧对话详情，可查看每个会话的 UUID、完整对话内容，支持一键复制 UUID 和删除会话。
+
+【注意事项】需要本机已安装 Claude Code CLI（npm install -g @anthropic-ai/claude-code）。失败时插件会自动用 session_id 续跑而非重开会话，尽量保留上下文。"""
+short_description = "让猫娘指挥 Claude Code 干活：同步/异步执行、智能等待、会话续跑控制、cc-switch 风格多供应商切换与会话管理面板。"
 keywords = [
     "claude",
     "claude-code",
@@ -14,8 +30,11 @@ keywords = [
     "adapter",
     "catgirl",
     "猫娘",
+    "cc-switch",
+    "provider",
+    "session-manager",
 ]
-version = "0.2.0"
+version = "0.3.0"
 id = "claude_code_adapter"
 entry = "plugin.plugins.claude_code_adapter._plugin_main:ClaudeCodeAdapterPlugin"
 

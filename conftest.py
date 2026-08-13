@@ -7,10 +7,14 @@ from unittest.mock import MagicMock
 # Use relative paths from conftest.py location
 collect_ignore = [
     "__init__.py",
+    "_plugin_main.py",
+    "claude_sessions.py",
     "executor.py",
     "models.py",
     "parser.py",
+    "provider_manager.py",
     "session.py",
+    "task_manager.py",
     "errors.py",
 ]
 

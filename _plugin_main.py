@@ -5,12 +5,17 @@
 
 工具集：
 - claude_code_execute: 同步执行（短任务，最长 300s）
-- claude_code_submit / claude_code_poll / claude_code_cancel:
-  异步提交 + 轮询模式，避免 main_server 的 300 秒超时限制
+- claude_code_submit / claude_code_poll / claude_code_wait /
+  claude_code_cancel: 异步提交 + 智能等待/轮询模式，
+  避免 main_server 的 300 秒超时限制
 - claude_code_check_health / claude_code_list_sessions /
   claude_code_clear_session / claude_code_get_config: 辅助工具
 - claude_code_list_providers / claude_code_switch_provider /
   claude_code_remove_provider: cc-switch 风格的多供应商切换
+
+会话控制（v0.3.0）：
+execute / submit 支持 session_mode（auto/new/resume）+ session_id，
+让猫娘能明确指定续跑同一会话或强制新开会话。
 """
 
 from __future__ import annotations
@@ -29,6 +34,7 @@ from plugin.sdk.plugin import (
     plugin_entry,
 )
 
+from . import claude_sessions
 from .errors import (
     ClassifiedError,
     is_retryable,
@@ -186,6 +192,45 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
         except Exception:
             return {}
 
+    async def _resolve_resume_id(
+        self,
+        *,
+        session_mode: str,
+        session_id: str,
+        cwd: str,
+        signature: str,
+    ) -> tuple[str, str]:
+        """根据会话模式解析要续跑的会话 ID。
+
+        Returns:
+            (resume_id, error_message)。error_message 非空时调用方应直接返回。
+
+        - auto: 自动查找可恢复会话（cwd + 提示包签名匹配）
+        - new:  强制新开会话（resume_id = ""）
+        - resume: 必须提供 session_id，强制续跑指定会话
+        """
+        assert self._session_mgr is not None
+        mode = (session_mode or "auto").strip().lower() or "auto"
+
+        if mode not in ("auto", "new", "resume"):
+            return "", (
+                f"无效的 session_mode: {session_mode!r}，"
+                "只支持 'auto' / 'new' / 'resume'。"
+            )
+        if mode == "new":
+            return "", ""
+        if mode == "resume":
+            sid = (session_id or "").strip()
+            if not sid:
+                return "", (
+                    "session_mode='resume' 需要同时提供 session_id。"
+                    "可先用 claude_code_list_sessions 查看可用会话。"
+                )
+            return sid, ""
+        # auto
+        record = await self._session_mgr.find_resumable(cwd, signature)
+        return (record.session_id if record else ""), ""
+
     # ------------------------------------------------------------------
     # 核心执行逻辑（内部方法，被 @llm_tool 方法调用）
     # ------------------------------------------------------------------
@@ -198,12 +243,16 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
         model: str = "",
         effort: str = "",
         max_turns: int = 0,
+        session_mode: str = "auto",
+        session_id: str = "",
     ) -> ExecuteResult:
         """执行 Claude Code 任务，支持自动重试。
 
         重试策略：
-        - 首次执行尝试恢复会话（如果存在可恢复的会话）
-        - 如果失败且错误可重试，新建会话重试
+        - auto 模式：首次尝试自动恢复会话（如果存在可恢复的会话）
+        - resume 模式：强制续跑指定 session_id，重试时仍续跑
+        - new 模式：始终新开会话
+        - 如果失败且错误可重试，auto/new 模式新建会话重试
         - 最多重试 self._config.max_retries 次
         """
         assert self._executor is not None and self._session_mgr is not None
@@ -214,17 +263,27 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
             skills_dir=self._config.skills_dir,
         )
 
-        # 尝试恢复会话
-        resume_record = await self._session_mgr.find_resumable(effective_cwd, signature)
-        resume_id = resume_record.session_id if resume_record else ""
+        # 根据会话模式解析续跑会话
+        resume_id, resolve_err = await self._resolve_resume_id(
+            session_mode=session_mode,
+            session_id=session_id,
+            cwd=effective_cwd,
+            signature=signature,
+        )
+        if resolve_err:
+            return ExecuteResult(
+                error_kind="invalid_argument",
+                error_message=resolve_err,
+            )
+        mode = (session_mode or "auto").strip().lower() or "auto"
 
         max_attempts = 1 + max(0, self._config.max_retries)
         last_error: Optional[ClassifiedError] = None
 
         for attempt in range(max_attempts):
             is_retry = attempt > 0
-            if is_retry:
-                # 重试时清空 resume_id，新建会话
+            if is_retry and mode != "resume":
+                # auto/new 模式重试时新建会话；resume 模式保持续跑
                 resume_id = ""
                 self.logger.info(
                     "Retrying with new session (attempt {}/{}): prev_error={}",
@@ -340,7 +399,10 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
             "- cwd: 工作目录（项目根目录的绝对路径）。同一目录的调用会自动复用会话上下文。\n"
             "- model: 模型 ID（可选）。留空使用适配器默认配置。\n"
             "- effort: 推理努力级别（可选）：'low' / 'medium' / 'high'。留空使用默认配置。\n"
-            "- max_turns: 最大轮次（可选，0=使用默认值）。\n\n"
+            "- max_turns: 最大轮次（可选，0=使用默认值）。\n"
+            "- session_mode: 会话控制（可选）：'auto'（默认，自动复用同目录会话）/ "
+            "'new'（强制新开会话）/ 'resume'（强制续跑 session_id 指定的会话）。\n"
+            "- session_id: 仅 session_mode='resume' 时需要，指定要续跑的会话 ID。\n\n"
             "返回：包含 Claude Code 的最终回复文本、会话 ID、费用、轮次等信息的字典。"
         ),
         parameters={
@@ -367,6 +429,18 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
                     "type": "integer",
                     "description": "最大轮次（可选，0=使用默认值）。",
                 },
+                "session_mode": {
+                    "type": "string",
+                    "description": (
+                        "会话控制：'auto'（默认，自动复用）/ 'new'（强制新会话）/ "
+                        "'resume'（续跑 session_id 指定的会话）。"
+                    ),
+                    "enum": ["", "auto", "new", "resume"],
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": "仅 session_mode='resume' 时需要：要续跑的会话 ID。",
+                },
             },
             "required": ["prompt"],
         },
@@ -379,6 +453,8 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
         model: str = "",
         effort: str = "",
         max_turns: int = 0,
+        session_mode: str = "auto",
+        session_id: str = "",
         **_,
     ) -> dict[str, Any]:
         """执行 Claude Code 任务。"""
@@ -396,6 +472,8 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
                 model=model,
                 effort=effort,
                 max_turns=max_turns,
+                session_mode=session_mode,
+                session_id=session_id,
             )
             return Ok(result.to_llm_payload())
         except Exception as e:
@@ -407,16 +485,19 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
         description=(
             "提交 Claude Code 编码任务到后台异步执行。适用于耗时较长的任务，"
             "避免 main_server 的 300 秒超时限制。\n\n"
-            "使用流程：\n"
+            "使用流程（推荐）：\n"
             "1. 调用 claude_code_submit 提交任务，立即返回 task_id\n"
-            "2. 调用 claude_code_poll 查询任务状态和结果\n"
-            "3. 如需取消，调用 claude_code_cancel\n\n"
+            "2. 根据任务复杂度预估耗时，调用 claude_code_wait 智能等待\n"
+            "   （任务一完成立即返回；超时则返回进度和建议的下次等待时长）\n"
+            "3. 也可用 claude_code_poll 单次查询；如需取消用 claude_code_cancel\n\n"
             "参数说明：\n"
             "- prompt: 详细描述要让 Claude Code 做什么。要具体、清晰，包含必要的上下文。\n"
             "- cwd: 工作目录（项目根目录的绝对路径）。\n"
             "- model: 模型 ID（可选）。留空使用适配器默认配置。\n"
             "- effort: 推理努力级别（可选）：'low' / 'medium' / 'high'。\n"
-            "- max_turns: 最大轮次（可选，0=使用默认值）。\n\n"
+            "- max_turns: 最大轮次（可选，0=使用默认值）。\n"
+            "- session_mode: 'auto'（默认）/ 'new'（强制新会话）/ 'resume'（续跑指定会话）。\n"
+            "- session_id: 仅 session_mode='resume' 时需要。\n\n"
             "返回：包含 task_id 和 status 的字典。"
         ),
         parameters={
@@ -443,6 +524,18 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
                     "type": "integer",
                     "description": "最大轮次（可选，0=使用默认值）。",
                 },
+                "session_mode": {
+                    "type": "string",
+                    "description": (
+                        "会话控制：'auto'（默认，自动复用）/ 'new'（强制新会话）/ "
+                        "'resume'（续跑 session_id 指定的会话）。"
+                    ),
+                    "enum": ["", "auto", "new", "resume"],
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": "仅 session_mode='resume' 时需要：要续跑的会话 ID。",
+                },
             },
             "required": ["prompt"],
         },
@@ -455,6 +548,8 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
         model: str = "",
         effort: str = "",
         max_turns: int = 0,
+        session_mode: str = "auto",
+        session_id: str = "",
         **_,
     ) -> dict[str, Any]:
         """提交 Claude Code 任务到后台异步执行。"""
@@ -469,18 +564,37 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
             return Err(SdkError("TaskManager not initialized"))
 
         try:
+            assert self._session_mgr is not None
+            # 提交时一次性解析续跑会话（TaskManager 不依赖 SessionManager）
+            effective_cwd = cwd or self._config.cwd or os.getcwd()
+            signature = compute_prompt_signature(
+                system_prompt_file=self._config.append_system_prompt_file,
+                skills_dir=self._config.skills_dir,
+            )
+            resume_id, resolve_err = await self._resolve_resume_id(
+                session_mode=session_mode,
+                session_id=session_id,
+                cwd=effective_cwd,
+                signature=signature,
+            )
+            if resolve_err:
+                return Err(SdkError(resolve_err))
+
             record = await self._task_mgr.submit(
                 prompt=prompt,
                 cwd=cwd,
                 model=model,
                 effort=effort,
                 max_turns=max_turns,
+                resume_session_id=resume_id,
             )
             return Ok(
                 {
                     "task_id": record.task_id,
                     "status": record.status.value,
-                    "message": "任务已提交，请使用 claude_code_poll 查询结果",
+                    "resumed_session": resume_id,
+                    "message": "任务已提交。建议根据预估耗时调用 claude_code_wait 等待结果，"
+                    "或用 claude_code_poll 单次查询。",
                 }
             )
         except Exception as e:
@@ -536,6 +650,75 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
         except Exception as e:
             self.logger.exception("claude_code_poll failed")
             return Err(SdkError(f"查询任务失败: {e}"))
+
+    @llm_tool(
+        name="claude_code_wait",
+        description=(
+            "智能等待 Claude Code 异步任务完成。在插件内部自动轮询，"
+            "任务一完成立即返回结果，比反复手动调用 claude_code_poll 更高效。\n\n"
+            "使用策略（重要）：\n"
+            "- 提交任务后，先根据任务复杂度预估耗时：\n"
+            "  简单任务（单文件小改）≈30-60s；中等任务（多文件修改/写测试）≈120s；\n"
+            "  复杂任务（重构/多步骤工程）≈240s 以上\n"
+            "- 按预估耗时设置 max_wait_sec；若超时返回 still_running，\n"
+            "  按返回的 suggested_next_wait_sec 再次调用本工具即可\n\n"
+            "参数说明：\n"
+            "- task_id: 任务 ID（从 claude_code_submit 返回）\n"
+            "- max_wait_sec: 本次最多等待的秒数（5-290，默认 60）\n"
+            "- poll_interval: 内部轮询初始间隔秒数（可选，自适应退避，无需关心）\n\n"
+            "返回：任务完成时返回完整结果；仍在运行时返回进度、"
+            "still_running=true 和 suggested_next_wait_sec。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "任务 ID（从 claude_code_submit 返回）。",
+                },
+                "max_wait_sec": {
+                    "type": "number",
+                    "description": "本次最多等待的秒数（5-290）。根据预估任务耗时设置。",
+                },
+                "poll_interval": {
+                    "type": "number",
+                    "description": "内部轮询初始间隔秒数（可选，1-15，默认自适应）。",
+                },
+            },
+            "required": ["task_id"],
+        },
+        timeout=295.0,
+    )
+    async def claude_code_wait(
+        self,
+        task_id: str = "",
+        max_wait_sec: float = 60.0,
+        poll_interval: float = 0.0,
+        **_,
+    ) -> dict[str, Any]:
+        """智能等待任务完成。"""
+        not_ready = self._ensure_ready()
+        if not_ready is not None:
+            return not_ready
+
+        if not task_id or not task_id.strip():
+            return Err(SdkError("task_id 不能为空"))
+
+        if self._task_mgr is None:
+            return Err(SdkError("TaskManager not initialized"))
+
+        try:
+            # 夹在安全区间：不超过 main_server 单次调用上限
+            wait_sec = max(5.0, min(290.0, float(max_wait_sec or 60.0)))
+            result = await self._task_mgr.wait_for(
+                task_id, max_wait_sec=wait_sec, interval_sec=float(poll_interval or 0)
+            )
+            if "error" in result and result["error"].startswith("Task not found"):
+                return Err(SdkError(result["error"]))
+            return Ok(result)
+        except Exception as e:
+            self.logger.exception("claude_code_wait failed")
+            return Err(SdkError(f"等待任务失败: {e}"))
 
     @llm_tool(
         name="claude_code_cancel",
@@ -936,6 +1119,14 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
                 "model": {"type": "string", "description": "模型 ID"},
                 "effort": {"type": "string", "description": "推理努力级别"},
                 "max_turns": {"type": "integer", "description": "最大轮次"},
+                "session_mode": {
+                    "type": "string",
+                    "description": "会话控制：auto / new / resume",
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": "session_mode=resume 时要续跑的会话 ID",
+                },
             },
             "required": ["prompt"],
         },
@@ -947,6 +1138,8 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
         model: str = "",
         effort: str = "",
         max_turns: int = 0,
+        session_mode: str = "auto",
+        session_id: str = "",
         **_,
     ) -> Any:
         """插件入口（与 LLM 工具功能相同，供 UI/其他插件调用）。"""
@@ -964,6 +1157,8 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
                 model=model,
                 effort=effort,
                 max_turns=max_turns,
+                session_mode=session_mode,
+                session_id=session_id,
             )
             return Ok(result.to_llm_payload())
         except Exception as e:
@@ -1024,6 +1219,117 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
         except Exception as e:
             self.logger.exception("submit_task_entry failed")
             return Err(SdkError(f"提交任务失败: {e}"))
+
+    # ------------------------------------------------------------------
+    # Claude 原生会话管理（供前端面板调用，照搬 cc-switch 会话管理器能力）
+    # ------------------------------------------------------------------
+
+    @plugin_entry(
+        id="list_claude_sessions",
+        name="列出 Claude 会话",
+        description="扫描 ~/.claude/projects 下的所有 Claude Code 会话记录（标题/时间/项目目录），供前端面板展示。",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": "最多返回的会话数（默认 200）",
+                },
+            },
+        },
+    )
+    async def list_claude_sessions_entry(self, limit: int = 200, **_) -> Any:
+        """扫描 Claude 原生会话存档。"""
+        try:
+            sessions = claude_sessions.scan_sessions(limit=int(limit or 200))
+            return Ok({"count": len(sessions), "sessions": sessions})
+        except Exception as e:
+            self.logger.exception("list_claude_sessions_entry failed")
+            return Err(SdkError(f"扫描会话失败: {e}"))
+
+    @plugin_entry(
+        id="get_claude_session",
+        name="读取会话消息",
+        description="读取指定 Claude 会话的完整消息列表（用户/AI/工具消息），供前端面板展示对话内容。",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "string",
+                    "description": "会话 ID",
+                },
+            },
+            "required": ["session_id"],
+        },
+    )
+    async def get_claude_session_entry(self, session_id: str = "", **_) -> Any:
+        """读取会话消息。"""
+        sid = (session_id or "").strip()
+        if not sid:
+            return Err(SdkError("session_id 不能为空"))
+        try:
+            # 先定位会话文件
+            target = None
+            for meta in claude_sessions.scan_sessions(limit=0):
+                if meta["session_id"] == sid:
+                    target = meta
+                    break
+            if target is None:
+                return Err(SdkError(f"会话不存在: {sid}"))
+            messages = claude_sessions.load_messages(
+                target["source_path"], expected_session_id=sid
+            )
+            return Ok(
+                {
+                    "session_id": sid,
+                    "title": target["title"],
+                    "project_dir": target["project_dir"],
+                    "created_at": target["created_at"],
+                    "last_active_at": target["last_active_at"],
+                    "message_count": len(messages),
+                    "messages": messages,
+                }
+            )
+        except Exception as e:
+            self.logger.exception("get_claude_session_entry failed")
+            return Err(SdkError(f"读取会话失败: {e}"))
+
+    @plugin_entry(
+        id="delete_claude_session",
+        name="删除 Claude 会话",
+        description="删除指定的 Claude 会话文件及同名 sidecar 目录（与 cc-switch 删除行为一致）。",
+        input_schema={
+            "type": "object",
+            "properties": {
+                "session_id": {
+                    "type": "string",
+                    "description": "要删除的会话 ID",
+                },
+            },
+            "required": ["session_id"],
+        },
+    )
+    async def delete_claude_session_entry(self, session_id: str = "", **_) -> Any:
+        """删除会话。"""
+        sid = (session_id or "").strip()
+        if not sid:
+            return Err(SdkError("session_id 不能为空"))
+        try:
+            target = None
+            for meta in claude_sessions.scan_sessions(limit=0):
+                if meta["session_id"] == sid:
+                    target = meta
+                    break
+            if target is None:
+                return Err(SdkError(f"会话不存在: {sid}"))
+            deleted = claude_sessions.delete_session(target["source_path"], sid)
+            if not deleted:
+                return Err(SdkError(f"删除失败（ID 不匹配或文件占用）: {sid}"))
+            self.logger.info("Deleted Claude session: {}", sid)
+            return Ok({"deleted": True, "session_id": sid})
+        except Exception as e:
+            self.logger.exception("delete_claude_session_entry failed")
+            return Err(SdkError(f"删除会话失败: {e}"))
 
 
 __all__ = ["ClaudeCodeAdapterPlugin"]

@@ -1,198 +1,414 @@
 import {
   Page,
-  Card,
-  Grid,
-  Stack,
-  Text,
-  Tip,
-  Alert,
-  CodeBlock,
-  Steps,
-  Step,
+  Toolbar,
+  ToolbarGroup,
+  StatusBadge,
+  EmptyState,
   Button,
-  Divider,
-  KeyValue,
+  RefreshButton,
+  Alert,
+  useState,
+  useEffect,
+  useToast,
+  useConfirm,
+  useClipboard,
 } from "@neko/plugin-ui"
 import type { PluginSurfaceProps } from "@neko/plugin-ui"
 
+// ==========================================================================
+// Claude Code Adapter — 会话管理面板
+//
+// 界面照搬 cc-switch（farion1231/cc-switch）的「会话管理」页：
+// - 左侧：会话列表（标题 + 时间 + 项目目录）
+// - 右侧：会话详情（UUID、时间、用户/AI 消息气泡、删除会话按钮）
+// 数据来源：~/.claude/projects 下的 Claude 原生会话存档（*.jsonl）
+// ==========================================================================
+
+type SessionMeta = {
+  session_id?: string
+  title?: string
+  summary?: string
+  project_dir?: string
+  created_at?: number | null
+  last_active_at?: number | null
+  source_path?: string
+}
+
+type SessionMessage = {
+  role?: string
+  content?: string
+  ts?: number | null
+}
+
+type SessionDetail = {
+  session_id?: string
+  title?: string
+  project_dir?: string
+  created_at?: number | null
+  last_active_at?: number | null
+  message_count?: number
+  messages?: SessionMessage[]
+}
+
 type PluginState = {
   cli_available?: boolean
-  cli_path?: string
-  model?: string
-  auto_inject_api_config?: boolean
+}
+
+function formatTime(ts: number | null | undefined): string {
+  if (!ts) return ""
+  const d = new Date(ts)
+  if (isNaN(d.getTime())) return ""
+  const pad = (n: number) => String(n).padStart(2, "0")
+  return `${d.getFullYear()}/${d.getMonth() + 1}/${d.getDate()} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
+}
+
+function projectName(dir: string | undefined): string {
+  if (!dir) return ""
+  const parts = String(dir).replace(/\\/g, "/").split("/").filter(Boolean)
+  return parts.length > 0 ? parts[parts.length - 1] : ""
+}
+
+const styles = {
+  body: {
+    display: "flex",
+    gap: "12px",
+    alignItems: "stretch",
+    minHeight: "560px",
+  },
+  sidebar: {
+    width: "300px",
+    minWidth: "300px",
+    border: "1px solid #e5e7eb",
+    borderRadius: "10px",
+    background: "#f9fafb",
+    overflowY: "auto",
+    maxHeight: "640px",
+  },
+  sidebarItem: {
+    padding: "10px 12px",
+    borderBottom: "1px solid #eef0f3",
+    cursor: "pointer",
+  },
+  sidebarItemSelected: {
+    background: "#e8f0fe",
+    borderLeft: "3px solid #4285f4",
+  },
+  itemTitle: {
+    fontSize: "13px",
+    fontWeight: 600,
+    color: "#1f2937",
+    overflow: "hidden",
+    textOverflow: "ellipsis",
+    display: "-webkit-box",
+    WebkitLineClamp: "2",
+    WebkitBoxOrient: "vertical",
+    lineHeight: "1.4",
+  },
+  itemMeta: {
+    fontSize: "11px",
+    color: "#9ca3af",
+    marginTop: "4px",
+    display: "flex",
+    justifyContent: "space-between",
+    gap: "8px",
+  },
+  detail: {
+    flex: "1",
+    minWidth: "0",
+    border: "1px solid #e5e7eb",
+    borderRadius: "10px",
+    background: "#ffffff",
+    display: "flex",
+    flexDirection: "column",
+    maxHeight: "640px",
+  },
+  detailHeader: {
+    padding: "12px 16px",
+    borderBottom: "1px solid #eef0f3",
+  },
+  detailTitle: {
+    fontSize: "15px",
+    fontWeight: 700,
+    color: "#111827",
+    margin: "0 0 6px 0",
+    wordBreak: "break-word",
+  },
+  detailMeta: {
+    fontSize: "11px",
+    color: "#9ca3af",
+    display: "flex",
+    flexWrap: "wrap",
+    gap: "10px",
+    alignItems: "center",
+  },
+  uuid: {
+    fontFamily: "ui-monospace, SFMono-Regular, Menlo, Consolas, monospace",
+    fontSize: "11px",
+    background: "#f3f4f6",
+    borderRadius: "4px",
+    padding: "1px 6px",
+    cursor: "pointer",
+  },
+  messages: {
+    flex: "1",
+    overflowY: "auto",
+    padding: "16px",
+    background: "#f5f6f8",
+  },
+  bubbleRow: {
+    display: "flex",
+    marginBottom: "14px",
+  },
+  bubble: {
+    maxWidth: "82%",
+    borderRadius: "10px",
+    padding: "10px 12px",
+    fontSize: "13px",
+    lineHeight: "1.6",
+    whiteSpace: "pre-wrap",
+    wordBreak: "break-word",
+  },
+  roleTag: {
+    fontSize: "11px",
+    fontWeight: 600,
+    padding: "1px 8px",
+    borderRadius: "999px",
+    marginBottom: "4px",
+    display: "inline-block",
+  },
+  deleteButton: {
+    background: "#dc2626",
+    color: "#ffffff",
+    border: "none",
+    borderRadius: "6px",
+    padding: "6px 14px",
+    fontSize: "13px",
+    cursor: "pointer",
+  },
+}
+
+function roleAppearance(role: string): { label: string; tagBg: string; tagFg: string; bubbleBg: string; align: string } {
+  if (role === "user") {
+    return { label: "用户", tagBg: "#dcfce7", tagFg: "#15803d", bubbleBg: "#ffffff", align: "flex-start" }
+  }
+  if (role === "assistant") {
+    return { label: "AI", tagBg: "#dbeafe", tagFg: "#1d4ed8", bubbleBg: "#eff6ff", align: "flex-start" }
+  }
+  return { label: "工具", tagBg: "#f3f4f6", tagFg: "#6b7280", bubbleBg: "#f9fafb", align: "flex-start" }
+}
+
+function MessageBubble({ message }: { message: SessionMessage }) {
+  const role = message.role || "unknown"
+  const appearance = roleAppearance(role)
+  return (
+    <div style={{ ...styles.bubbleRow, justifyContent: appearance.align }}>
+      <div style={{ maxWidth: "82%" }}>
+        <span style={{ ...styles.roleTag, background: appearance.tagBg, color: appearance.tagFg }}>
+          {appearance.label}
+        </span>
+        {message.ts ? (
+          <span style={{ fontSize: "11px", color: "#9ca3af", marginLeft: "8px" }}>
+            {formatTime(message.ts)}
+          </span>
+        ) : null}
+        <div style={{ ...styles.bubble, background: appearance.bubbleBg, border: "1px solid #e5e7eb", marginTop: "4px" }}>
+          {message.content || ""}
+        </div>
+      </div>
+    </div>
+  )
 }
 
 export default function ClaudeCodeAdapterPanel(props: PluginSurfaceProps<PluginState>) {
-  const { state } = props
-  const { t } = props
-  const safeState = state || {}
-  const cliAvailable = safeState.cli_available || false
-  const cliPath = safeState.cli_path || ""
-  const model = safeState.model || ""
-  const autoInject = safeState.auto_inject_api_config !== false
+  const { api } = props
+  const toast = useToast()
+  const confirm = useConfirm()
+  const clipboard = useClipboard()
+
+  const [sessions, setSessions] = useState<SessionMeta[]>([])
+  const [loadingList, setLoadingList] = useState(false)
+  const [listError, setListError] = useState("")
+  const [selectedId, setSelectedId] = useState("")
+  const [detail, setDetail] = useState<SessionDetail | null>(null)
+  const [loadingDetail, setLoadingDetail] = useState(false)
+  const [detailError, setDetailError] = useState("")
+  const [deleting, setDeleting] = useState(false)
+
+  const loadSessions = async () => {
+    setLoadingList(true)
+    setListError("")
+    try {
+      const result: any = await api.call("list_claude_sessions", { limit: 300 }, { timeoutMs: 60000 })
+      const list = Array.isArray(result && result.sessions) ? result.sessions : []
+      setSessions(list)
+    } catch (error: any) {
+      setListError(error && error.message ? error.message : String(error))
+    } finally {
+      setLoadingList(false)
+    }
+  }
+
+  const loadDetail = async (sessionId: string) => {
+    setLoadingDetail(true)
+    setDetailError("")
+    setDetail(null)
+    try {
+      const result: any = await api.call("get_claude_session", { session_id: sessionId }, { timeoutMs: 60000 })
+      setDetail(result || null)
+    } catch (error: any) {
+      setDetailError(error && error.message ? error.message : String(error))
+    } finally {
+      setLoadingDetail(false)
+    }
+  }
+
+  useEffect(() => {
+    loadSessions()
+  }, [])
+
+  const onSelect = (sessionId: string) => {
+    if (!sessionId || sessionId === selectedId) return
+    setSelectedId(sessionId)
+    loadDetail(sessionId)
+  }
+
+  const onDelete = async () => {
+    if (!selectedId || deleting) return
+    const accepted = await confirm({
+      title: "删除会话",
+      message: `确定删除会话 ${selectedId.slice(0, 8)}… 吗？会话文件和附属数据将被永久删除，无法恢复。`,
+      tone: "danger",
+      confirmLabel: "删除会话",
+      cancelLabel: "取消",
+    })
+    if (!accepted) return
+    setDeleting(true)
+    try {
+      await api.call("delete_claude_session", { session_id: selectedId }, { userInitiated: true })
+      toast.success("会话已删除")
+      setSelectedId("")
+      setDetail(null)
+      await loadSessions()
+    } catch (error: any) {
+      toast.error(error && error.message ? error.message : String(error))
+    } finally {
+      setDeleting(false)
+    }
+  }
+
+  const copyUuid = async () => {
+    if (!selectedId) return
+    try {
+      await clipboard.write(selectedId)
+      toast.success("会话 UUID 已复制")
+    } catch (error: any) {
+      toast.error("复制失败：" + (error && error.message ? error.message : String(error)))
+    }
+  }
 
   return (
-    <Page
-      title={t("panel.title")}
-      subtitle={t("panel.subtitle")}
-    >
-      {/* 状态概览 */}
-      <Card title={t("panel.status.title")}>
-        <Stack>
-          <KeyValue
-            items={[
-              {
-                key: "status",
-                label: t("panel.status.cliStatus"),
-                value: cliAvailable ? t("panel.status.installed") : t("panel.status.notInstalled"),
-              },
-              {
-                key: "path",
-                label: t("panel.status.cliPath"),
-                value: cliPath || t("panel.status.unknown"),
-              },
-              {
-                key: "model",
-                label: t("panel.status.model"),
-                value: model || t("panel.status.default"),
-              },
-              {
-                key: "inject",
-                label: t("panel.status.autoInject"),
-                value: autoInject ? t("panel.status.enabled") : t("panel.status.disabled"),
-              },
-            ]}
-          />
-          {!cliAvailable && (
-            <Alert tone="warning">
-              {t("panel.status.installRequired")}
-            </Alert>
-          )}
-        </Stack>
-      </Card>
+    <Page title="CC Switch" subtitle="会话管理 — 查看 / 检索 / 删除 Claude Code 会话">
+      <Toolbar>
+        <ToolbarGroup>
+          <StatusBadge tone={sessions.length > 0 ? "success" : "warning"}>
+            共 {sessions.length} 个会话
+          </StatusBadge>
+          {loadingList ? <StatusBadge tone="info">扫描中…</StatusBadge> : null}
+        </ToolbarGroup>
+        <ToolbarGroup>
+          <RefreshButton onClick={loadSessions}>刷新</RefreshButton>
+        </ToolbarGroup>
+      </Toolbar>
 
-      {/* 安装指南 */}
-      <Card title={t("panel.install.title")}>
-        <Steps>
-          <Step index="1" title={t("panel.install.step1.title")}>
-            <Stack>
-              <Text>{t("panel.install.step1.desc")}</Text>
-              <Tip>{t("panel.install.step1.tip")}</Tip>
-              <Button
-                tone="primary"
-                onClick={() => window.open("https://nodejs.org/zh-cn", "_blank")}
-              >
-                {t("panel.install.step1.button")}
-              </Button>
-            </Stack>
-          </Step>
+      {listError ? <Alert tone="danger">扫描会话失败：{listError}</Alert> : null}
 
-          <Step index="2" title={t("panel.install.step2.title")}>
-            <Stack>
-              <Text>{t("panel.install.step2.desc")}</Text>
-              <CodeBlock language="bash">
-                {t("panel.install.step2.command")}
-              </CodeBlock>
-              <Tip>{t("panel.install.step2.tip")}</Tip>
-            </Stack>
-          </Step>
+      {sessions.length === 0 && !loadingList && !listError ? (
+        <EmptyState
+          title="暂无 Claude 会话"
+          description="还没有任何 Claude Code 会话记录。让猫娘调用 claude_code_execute / claude_code_submit 执行任务后，会话会自动出现在这里。"
+        />
+      ) : (
+        <div style={styles.body}>
+          {/* 左侧：会话列表 */}
+          <div style={styles.sidebar}>
+            {sessions.map((session) => {
+              const id = session.session_id || ""
+              const selected = id === selectedId
+              return (
+                <div
+                  key={id}
+                  style={{ ...styles.sidebarItem, ...(selected ? styles.sidebarItemSelected : {}) }}
+                  onClick={() => onSelect(id)}
+                >
+                  <div style={styles.itemTitle}>{session.title || "(无标题)"}</div>
+                  <div style={styles.itemMeta}>
+                    <span>{projectName(session.project_dir) || "未知项目"}</span>
+                    <span>{formatTime(session.last_active_at || session.created_at)}</span>
+                  </div>
+                </div>
+              )
+            })}
+          </div>
 
-          <Step index="3" title={t("panel.install.step3.title")}>
-            <Stack>
-              <Text>{t("panel.install.step3.desc")}</Text>
-              <CodeBlock language="bash">
-                {t("panel.install.step3.command")}
-              </CodeBlock>
-              <Tip>{t("panel.install.step3.tip")}</Tip>
-            </Stack>
-          </Step>
+          {/* 右侧：会话详情 */}
+          <div style={styles.detail}>
+            {!selectedId ? (
+              <div style={{ padding: "40px", color: "#9ca3af", textAlign: "center", fontSize: "13px" }}>
+                从左侧选择一个会话查看对话内容
+              </div>
+            ) : (
+              <>
+                <div style={styles.detailHeader}>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: "12px", alignItems: "flex-start" }}>
+                    <div style={{ minWidth: 0, flex: 1 }}>
+                      <p style={styles.detailTitle}>{(detail && detail.title) || selectedId}</p>
+                      <div style={styles.detailMeta}>
+                        <span>{formatTime((detail && detail.created_at) || undefined) || "—"}</span>
+                        <span
+                          style={styles.uuid}
+                          title="点击复制完整 UUID"
+                          onClick={copyUuid}
+                        >
+                          {clipboard.copied ? "已复制 ✓" : selectedId}
+                        </span>
+                        {detail && detail.project_dir ? <span>{detail.project_dir}</span> : null}
+                      </div>
+                    </div>
+                    <button
+                      style={{ ...styles.deleteButton, opacity: deleting ? 0.6 : 1 }}
+                      disabled={deleting}
+                      onClick={onDelete}
+                    >
+                      {deleting ? "删除中…" : "删除会话"}
+                    </button>
+                  </div>
+                </div>
 
-          <Step index="4" title={t("panel.install.step4.title")}>
-            <Stack>
-              <Text>{t("panel.install.step4.desc")}</Text>
-              <CodeBlock language="bash">
-                {t("panel.install.step4.command")}
-              </CodeBlock>
-              <Tip>{t("panel.install.step4.tip")}</Tip>
-            </Stack>
-          </Step>
-        </Steps>
-      </Card>
-
-      {/* 配置说明 */}
-      <Card title={t("panel.config.title")}>
-        <Stack>
-          <Text>{t("panel.config.desc1")}</Text>
-          <Divider />
-          <Text>{t("panel.config.desc2")}</Text>
-          <CodeBlock language="json">
-            {`{
-  "api_key": "sk-ant-xxx",
-  "base_url": "https://api.anthropic.com"
-}`}
-          </CodeBlock>
-          <Tip>{t("panel.config.tip1")}</Tip>
-          <Divider />
-          <Text>{t("panel.config.desc3")}</Text>
-          <CodeBlock language="bash">
-            {`# Windows PowerShell
-$env:ANTHROPIC_API_KEY="sk-ant-xxx"
-$env:ANTHROPIC_BASE_URL="https://api.anthropic.com"
-
-# macOS/Linux
-export ANTHROPIC_API_KEY="sk-ant-xxx"
-export ANTHROPIC_BASE_URL="https://api.anthropic.com"`}
-          </CodeBlock>
-          <Tip>{t("panel.config.tip2")}</Tip>
-        </Stack>
-      </Card>
-
-      {/* 使用示例 */}
-      <Card title={t("panel.usage.title")}>
-        <Stack>
-          <Text>{t("panel.usage.desc")}</Text>
-          <Divider />
-          <Text>{t("panel.usage.example1.title")}</Text>
-          <CodeBlock>
-            {t("panel.usage.example1.text")}
-          </CodeBlock>
-          <Divider />
-          <Text>{t("panel.usage.example2.title")}</Text>
-          <CodeBlock>
-            {t("panel.usage.example2.text")}
-          </CodeBlock>
-        </Stack>
-      </Card>
-
-      {/* 常见问题 */}
-      <Card title={t("panel.faq.title")}>
-        <Stack>
-          <Text>
-            <strong>Q: {t("panel.faq.q1")}</strong>
-          </Text>
-          <Text>{t("panel.faq.a1")}</Text>
-          <Divider />
-          <Text>
-            <strong>Q: {t("panel.faq.q2")}</strong>
-          </Text>
-          <Text>{t("panel.faq.a2")}</Text>
-          <Divider />
-          <Text>
-            <strong>Q: {t("panel.faq.q3")}</strong>
-          </Text>
-          <Text>{t("panel.faq.a3")}</Text>
-          <Divider />
-          <Text>
-            <strong>Q: {t("panel.faq.q4")}</strong>
-          </Text>
-          <Text>{t("panel.faq.a4")}</Text>
-        </Stack>
-      </Card>
-
-      {/* 温馨提示 */}
-      <Tip>
-        {t("panel.tip")}
-      </Tip>
+                <div style={styles.messages}>
+                  {loadingDetail ? (
+                    <div style={{ color: "#9ca3af", fontSize: "13px", padding: "16px" }}>加载对话内容中…</div>
+                  ) : detailError ? (
+                    <div style={{ padding: "16px" }}>
+                      <Alert tone="danger">加载失败：{detailError}</Alert>
+                      <Button onClick={() => loadDetail(selectedId)}>重试</Button>
+                    </div>
+                  ) : detail && Array.isArray(detail.messages) ? (
+                    detail.messages.length > 0 ? (
+                      detail.messages.map((message, index) => (
+                        <MessageBubble key={`${index}`} message={message} />
+                      ))
+                    ) : (
+                      <div style={{ color: "#9ca3af", fontSize: "13px", padding: "16px" }}>
+                        该会话没有可展示的消息内容。
+                      </div>
+                    )
+                  ) : null}
+                </div>
+              </>
+            )}
+          </div>
+        </div>
+      )}
     </Page>
   )
 }

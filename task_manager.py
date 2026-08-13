@@ -2,7 +2,11 @@
 Claude Code 异步任务管理器
 
 支持后台执行 Claude Code 任务，避免 main_server 的 300 秒超时限制。
-采用异步提交 + 轮询/主动通知的混合模式。
+采用异步提交 + 智能等待/主动轮询的混合模式。
+
+v0.3.0 增强：
+- 失败时自动用 session_id 续跑（--resume）而非重开新会话
+- 提供 wait_for 智能等待（自适应间隔），替代高频空轮询
 """
 
 from __future__ import annotations
@@ -15,6 +19,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
+from .errors import is_retryable
 from .executor import build_cli_invocation
 from .models import ExecuteResult
 from .parser import ClaudeOutputParser
@@ -42,7 +47,8 @@ class TaskRecord:
     model: str = ""
     effort: str = ""
     max_turns: int = 0
-    resume_session_id: str = ""  # 用于判断是否是新会话
+    resume_session_id: str = ""  # 提交时指定的续跑会话（空=新会话）
+    session_id: str = ""  # 执行过程中从 CLI 流中捕获的会话 ID
     status: TaskStatus = TaskStatus.PENDING
     created_at: float = field(default_factory=time.time)
     started_at: Optional[float] = None
@@ -64,6 +70,9 @@ class TaskRecord:
             "created_at": self.created_at,
             "elapsed": round(elapsed, 2),
         }
+
+        if self.session_id:
+            data["session_id"] = self.session_id
 
         if self.status == TaskStatus.DONE and self.result:
             data["result"] = self.result.to_llm_payload()
@@ -136,9 +145,16 @@ class TaskManager:
         model: str = "",
         effort: str = "",
         max_turns: int = 0,
+        resume_session_id: str = "",
     ) -> TaskRecord:
         """
         提交任务到后台执行
+
+        Parameters
+        ----------
+        resume_session_id:
+            由调用方（插件主类）根据 session_mode 预先解析：
+            非空时任务会以 ``--resume <id>`` 续跑该会话；空则新开会话。
 
         Returns:
             TaskRecord: 任务记录（包含 task_id 和初始状态）
@@ -161,6 +177,7 @@ class TaskManager:
                 model=model,
                 effort=effort,
                 max_turns=max_turns,
+                resume_session_id=resume_session_id,
                 status=TaskStatus.PENDING,
             )
             self._tasks[task_id] = record
@@ -183,6 +200,57 @@ class TaskManager:
             if not record:
                 return {"error": f"Task not found: {task_id}"}
             return record.to_dict()
+
+    async def wait_for(
+        self,
+        task_id: str,
+        max_wait_sec: float = 60.0,
+        interval_sec: float = 0.0,
+    ) -> Dict[str, Any]:
+        """智能等待：在插件内部轮询任务直到完成或超时。
+
+        相比猫娘高频手动 poll，这个方式：
+        - 任务一旦完成立即返回，不白等
+        - 自适应退避间隔（3s → 5s → 8s → 封顶 15s），避免空转
+        - 超时后返回进度和建议的下次等待时长，供猫娘规划
+
+        Returns:
+            完成/失败时返回完整结果；仍在运行时返回进度 +
+            ``still_running=True`` 和 ``suggested_next_wait_sec``。
+        """
+        deadline = time.time() + max(1.0, max_wait_sec)
+        # 自适应间隔：斐波那契式退避，封顶 15s
+        interval = interval_sec if interval_sec > 0 else 3.0
+        interval = max(1.0, min(interval, 15.0))
+
+        while True:
+            async with self._lock:
+                record = self._tasks.get(task_id)
+                if not record:
+                    return {"error": f"Task not found: {task_id}"}
+                if record.status in (
+                    TaskStatus.DONE,
+                    TaskStatus.ERROR,
+                    TaskStatus.CANCELLED,
+                ):
+                    return record.to_dict()
+                elapsed = time.time() - (record.started_at or record.created_at)
+
+            if time.time() >= deadline:
+                data = record.to_dict()
+                data["still_running"] = True
+                # 建议下次等待时长：剩余预期的一半，夹在 [5, 120]
+                data["suggested_next_wait_sec"] = min(
+                    120.0, max(5.0, round(max_wait_sec * 1.5))
+                )
+                data["message"] = (
+                    f"任务仍在运行（已耗时 {elapsed:.0f}s）。"
+                    f"建议 {data['suggested_next_wait_sec']:.0f}s 后再次调用 claude_code_wait。"
+                )
+                return data
+
+            await asyncio.sleep(min(interval, max(0.1, deadline - time.time())))
+            interval = min(15.0, interval * 1.6)
 
     async def cancel(self, task_id: str) -> Dict[str, Any]:
         """
@@ -216,44 +284,37 @@ class TaskManager:
         return {"status": "cancelled", "task_id": task_id}
 
     async def _execute_task(self, record: TaskRecord):
-        """后台执行任务"""
+        """后台执行任务。
+
+        失败处理策略（v0.3.0）：
+        - 若错误可重试且已从流中捕获到 session_id，自动用
+          ``--resume <session_id>`` 续跑一次，而非重开新会话（保留上下文）。
+        - 续跑仍失败才标记为 ERROR。
+        """
         try:
             record.status = TaskStatus.RUNNING
             record.started_at = time.time()
 
-            # 构建 CLI 调用（注入激活 provider 的环境变量，提交时取值）
-            extra_env = self._env_provider() if callable(self._env_provider) else {}
-            invocation, build_err = build_cli_invocation(
-                self._config,
-                prompt=record.prompt,
-                cwd=record.cwd,
-                model=record.model,
-                effort=record.effort,
-                max_turns=record.max_turns,
-                extra_env=extra_env,
-            )
+            # 提交时确定的续跑会话
+            resume_id = record.resume_session_id
 
-            if build_err:
-                raise RuntimeError(f"Failed to build CLI invocation: {build_err}")
+            result, exec_err = await self._run_once(record, resume_id)
 
-            # 执行
-            parser = ClaudeOutputParser()
-            stream, exec_err = await self._executor.execute(invocation, parser)
+            # 可重试失败 + 已有会话 → 用 session_id 续跑一次
+            if (
+                exec_err is not None
+                and is_retryable(getattr(exec_err, "kind", ""))
+                and record.session_id
+            ):
+                self.logger.info(
+                    f"Task {record.task_id}: retryable failure "
+                    f"({getattr(exec_err, 'kind', 'unknown')}), "
+                    f"resuming session {record.session_id}"
+                )
+                result, exec_err = await self._run_once(record, record.session_id)
 
             if exec_err:
                 raise RuntimeError(f"Execution failed: {exec_err}")
-
-            # 构造结果
-            result = ExecuteResult(
-                session_id=stream.session_id,
-                is_new_session=not bool(record.resume_session_id),
-                messages=stream.messages,
-                final_text=stream.final_text,
-                total_cost_usd=stream.result.total_cost_usd if stream.result else 0.0,
-                duration_ms=stream.result.duration_ms if stream.result else 0,
-                num_turns=stream.result.num_turns if stream.result else 0,
-                raw_result=stream.result.raw if stream.result else {},
-            )
 
             record.result = result
             record.status = TaskStatus.DONE
@@ -271,6 +332,46 @@ class TaskManager:
             record.error_message = str(e)
             record.finished_at = time.time()
             self.logger.error(f"Task failed: {record.task_id}, error: {e}")
+
+    async def _run_once(self, record: TaskRecord, resume_id: str):
+        """执行一次 CLI 调用，返回 (ExecuteResult | None, error | None)。"""
+        # 构建 CLI 调用（注入激活 provider 的环境变量，提交时取值）
+        extra_env = self._env_provider() if callable(self._env_provider) else {}
+        invocation, build_err = build_cli_invocation(
+            self._config,
+            prompt=record.prompt,
+            resume_session_id=resume_id,
+            cwd=record.cwd,
+            model=record.model,
+            effort=record.effort,
+            max_turns=record.max_turns,
+            extra_env=extra_env,
+        )
+
+        if build_err:
+            raise RuntimeError(f"Failed to build CLI invocation: {build_err}")
+
+        parser = ClaudeOutputParser()
+        stream, exec_err = await self._executor.execute(invocation, parser)
+
+        # 捕获会话 ID（无论成败，供续跑和 UI 展示）
+        if stream.session_id:
+            record.session_id = stream.session_id
+
+        if exec_err:
+            return None, exec_err
+
+        result = ExecuteResult(
+            session_id=stream.session_id,
+            is_new_session=not bool(resume_id),
+            messages=stream.messages,
+            final_text=stream.final_text,
+            total_cost_usd=stream.result.total_cost_usd if stream.result else 0.0,
+            duration_ms=stream.result.duration_ms if stream.result else 0,
+            num_turns=stream.result.num_turns if stream.result else 0,
+            raw_result=stream.result.raw if stream.result else {},
+        )
+        return result, None
 
     async def _cleanup_loop(self):
         """定期清理过期任务"""
