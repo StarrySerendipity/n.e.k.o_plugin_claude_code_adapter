@@ -36,8 +36,12 @@ class AdapterConfig:
     dangerously_skip_permissions: bool = True
     """跳过权限提示。仅用于受信任的本地开发场景。"""
 
-    timeout_sec: int = 300
-    """单次执行超时（秒）。main_server 上限 300s。"""
+    timeout_sec: int = 0
+    """单次执行超时（秒）。0 = 不限制（默认）。
+
+    Claude Code 常执行半小时以上的长任务，默认不设超时；
+    仅在配置中显式指定时才强制杀进程。
+    """
 
     cwd: str = ""
     """默认工作目录。空字符串表示使用插件进程 cwd。"""
@@ -85,7 +89,7 @@ class AdapterConfig:
             effort=_str("effort"),
             max_turns_per_run=_int("max_turns_per_run", 0),
             dangerously_skip_permissions=_bool("dangerously_skip_permissions", True),
-            timeout_sec=_int("timeout_sec", 300) or 300,
+            timeout_sec=max(0, _int("timeout_sec", 0)),
             cwd=_str("cwd"),
             append_system_prompt_file=_str("append_system_prompt_file"),
             skills_dir=_str("skills_dir"),
@@ -278,7 +282,7 @@ class CLIInvocation:
     """标准输入数据（prompt）。"""
 
     timeout: float
-    """超时（秒）。"""
+    """超时（秒）。0 或负数表示不限制。"""
 
     env_overrides: dict[str, str] = field(default_factory=dict)
     """环境变量覆盖。"""

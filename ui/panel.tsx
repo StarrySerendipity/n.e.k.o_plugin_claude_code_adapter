@@ -325,7 +325,7 @@ export default function ClaudeCodeAdapterPanel(props: PluginSurfaceProps<PluginS
       {sessions.length === 0 && !loadingList && !listError ? (
         <EmptyState
           title="暂无 Claude 会话"
-          description="还没有任何 Claude Code 会话记录。让猫娘调用 claude_code_execute / claude_code_submit 执行任务后，会话会自动出现在这里。"
+          description="还没有任何 Claude Code 会话记录。让猫娘调用 claude_code_submit 执行任务后，会话会自动出现在这里。"
         />
       ) : (
         <div style={styles.body}>

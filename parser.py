@@ -237,6 +237,11 @@ class ClaudeOutputParser:
             parse_errors=list(self._parse_errors),
         )
 
+    @property
+    def messages(self) -> list[AssistantMessage]:
+        """截至当前已解析的 assistant 消息（实时进度，供运行中查询）。"""
+        return self._messages
+
 
 # ---------------------------------------------------------------------------
 # 流式回调类型

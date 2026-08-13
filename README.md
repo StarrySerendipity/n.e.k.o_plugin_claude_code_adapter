@@ -1,6 +1,6 @@
 # Claude Code Adapter
 
-让猫娘指挥 Claude Code 干活的 N.E.K.O 插件。把 Claude Code CLI 注册为猫娘可调用的工具集，支持同步/异步执行、智能等待、会话续跑控制、cc-switch 风格多供应商切换，并内置 cc-switch 风格的会话管理面板。
+让猫娘指挥 Claude Code 干活的 N.E.K.O 插件。把 Claude Code CLI 注册为猫娘可调用的工具集：全异步执行（无超时限制，专为半小时以上的长任务设计）、完成自动推送结果、执行中同会话纠正、会话续跑控制、cc-switch 风格多供应商切换，并内置 cc-switch 风格的会话管理面板。
 
 ## 前置条件
 
@@ -14,25 +14,18 @@ npm install -g @anthropic-ai/claude-code
 
 你不需要记任何工具名，用自然语言跟猫娘说即可，下面是推荐话术：
 
-### 1. 短任务（预计 5 分钟内完成）
+### 1. 执行任务（全异步，无超时限制）
 
 > 用 Claude Code 帮我把 `D:\myproject` 里的登录页加上表单校验
 
-猫娘会调用 `claude_code_execute` 同步执行（上限 300 秒），完成后直接回复 Claude Code 的结果、会话 ID、费用和轮次。
+v0.6.0 起插件只有异步执行入口（同步会被网关 ~60s ReadTimeout 卡死，且 Claude Code 本就擅长长任务）。流程：
 
-### 2. 长任务（超过 5 分钟）
+1. 猫娘调用 `claude_code_submit` 提交任务，立即拿到 `task_id`，先回复你「任务正在执行」；
+2. 任务在后台执行，**没有超时限制**——半小时到一小时以上的长任务完全没问题；
+3. 任务完成后插件**自动把结果推送给猫娘**（push_message 注入对话频道），她会主动来汇报；
+4. 想提前盯进度就说「任务跑到哪了」，猫娘用 `claude_code_wait`（单次最多 55s，可反复调用，返回含实时进度：已输出消息数/最近动态）或 `claude_code_poll` 查询；想中止就说「取消那个任务」。
 
-> 提交一个 Claude Code 后台任务：把整个项目的测试覆盖率补到 80%
-
-猫娘会：
-1. `claude_code_submit` 提交任务拿到 `task_id`；
-2. 根据任务复杂度**自行预估耗时**，调用 `claude_code_wait` 智能等待——插件内部自适应退避轮询，任务一完成立即返回，不空转；
-3. 若一次没等到，按返回的 `suggested_next_wait_sec` 继续等；
-4. 完成后主动把结果汇报给你。
-
-你也可以随时问「刚才那个任务跑得怎么样了」，猫娘会用 `claude_code_poll` 单次查询；想中止就说「取消那个任务」。
-
-### 3. 会话控制（重点）
+### 2. 会话控制（重点）
 
 每个 Claude Code 会话都有一个唯一 UUID（即工具返回的 `session_id`，与 cc-switch 会话管理里看到的是同一个）。本插件以它作为会话主标识，提供三档明确的控制，猫娘不会再「想续会话却开了新会话」：
 
@@ -52,7 +45,7 @@ resume 模式对 UUID 很宽容：完整 UUID、唯一前缀（如面板里截�
 
 任务失败时插件会自动用 `session_id` 以 `--resume` 续跑而非重开新会话，尽量保留上下文。
 
-### 4. 供应商切换（cc-switch 风格）
+### 3. 供应商切换（cc-switch 风格）
 
 > 切换 Claude 供应商到 relay
 
@@ -76,10 +69,9 @@ resume 模式对 UUID 很宽容：完整 UUID、唯一前缀（如面板里截�
 
 | 工具 | 用途 |
 |---|---|
-| `claude_code_execute` | 同步执行（≤300s），支持 session_mode/session_id |
-| `claude_code_submit` | 提交异步任务，返回 task_id，支持 session_mode/session_id |
-| `claude_code_wait` | 智能等待任务完成（自适应退避，超时给出续等建议） |
-| `claude_code_poll` | 单次查询任务状态 |
+| `claude_code_submit` | 唯一的执行入口：提交异步任务（无超时限制），返回 task_id，支持 session_mode/session_id；完成后自动推送结果给猫娘 |
+| `claude_code_wait` | 提前盯进度（单次最多 55s 可反复调用，运行中返回实时进度） |
+| `claude_code_poll` | 单次查询任务状态（运行中含实时进度） |
 | `claude_code_cancel` | 取消任务 |
 | `claude_code_check_health` | 检查 CLI 是否可用、版本、配置 |
 | `claude_code_list_sessions` | 列出会话索引；`include_history=true` 时额外列出 `~/.claude/projects` 所有历史会话 UUID |
@@ -97,7 +89,7 @@ model = ""                        # 默认模型，留空用 CLI 默认
 effort = ""                       # "" | "low" | "medium" | "high"
 max_turns_per_run = 0             # 单次最大轮次，0=默认
 dangerously_skip_permissions = true
-timeout_sec = 300                 # 单次执行超时
+timeout_sec = 0                   # 单次执行超时（秒），0=不限制（默认，长任务无需限制）
 cwd = ""                          # 默认工作目录
 append_system_prompt_file = ""    # 附加系统提示文件
 skills_dir = ""                   # 技能目录（--add-dir）
@@ -137,8 +129,8 @@ ruff check . && ruff format --check .
 推送与 `plugin.toml` 版本匹配的标签以创建 GitHub Release 资源：
 
 ```bash
-git tag v0.5.0
-git push origin v0.5.0
+git tag v0.6.0
+git push origin v0.6.0
 ```
 
 `.github/workflows/release.yml` 会上传 `claude_code_adapter.neko-plugin`，在插件市场发布版本时使用该 GitHub Release URL。
@@ -150,6 +142,14 @@ entry = "plugins.claude_code_adapter:ClaudeCodeAdapterPlugin"
 ```
 
 ## 版本历史
+
+### v0.6.0 (2026-08-13)
+- **全异步化**：移除同步 `claude_code_execute`（会被网关 ~60s ReadTimeout 卡死），`claude_code_submit` 成为唯一执行入口
+- **无超时限制**：默认 `timeout_sec = 0`，支持半小时到一小时以上的长任务（修复异步任务硬编码 300s 超时导致长任务必失败的问题）
+- **完成自动推送**：任务完成/失败时插件经 push_message 把结果注入对话频道，猫娘自动收到并主动汇报，无需轮询到底
+- **实时进度**：poll/wait 运行中返回 progress（已输出消息数/最近动态），猫娘能向用户汇报「任务在干吗」
+- `claude_code_wait` 单次夹到 55s 以内（超过会被网关 ReadTimeout），定位为可选的提前盯进度工具
+- 结果保留时间 600s → 3600s，最大并发任务数 2 → 3
 
 ### v0.5.0 (2026-08-13)
 - 新增 `claude_code_followup`：任务执行中发现方向跑偏，可中断当前任务并在同一会话（同一 UUID）里追加纠正指令，已有上下文全部保留；已完成的会话也可直接续发补充指令

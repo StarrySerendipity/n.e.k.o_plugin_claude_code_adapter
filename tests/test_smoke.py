@@ -725,5 +725,182 @@ def test_followup_interrupt_and_resume(tmp_path):
         cs.claude_projects_root = orig_root
 
 
+def test_async_no_timeout_and_on_complete():
+    """v0.6.0：默认无超时（timeout_sec=0 传递到 invocation）+ on_complete 回调语义。"""
+    import asyncio
+    from unittest.mock import MagicMock
+
+    models = _load_pkg_module("models.py", "models")
+    errors = _load_pkg_module("errors.py", "errors")
+    _load_pkg_module("parser.py", "parser")
+    _load_pkg_module("executor.py", "executor")
+    tm = _load_pkg_module("task_manager.py", "task_manager")
+    pm = _load_pkg_module("_plugin_main.py", "_plugin_main")
+
+    # 默认配置不限制超时（长任务半小时以上常见）
+    config = models.AdapterConfig(command="fake-claude")
+    assert config.timeout_sec == 0
+
+    class _FakeStream:
+        def __init__(self):
+            self.session_id = "sess-t"
+            self.messages = []
+            self.final_text = "ok"
+            self.result = None
+
+    class _FlexExecutor:
+        """按指令内容决定行为：fail→不可重试错误；block→阻塞等取消；其他→成功。"""
+
+        def __init__(self):
+            self.timeouts = []
+
+        async def execute(self, invocation, parser):
+            self.timeouts.append(invocation.timeout)
+            prompt = invocation.stdin_data.decode("utf-8")
+            if prompt == "fail":
+                err = errors.ClassifiedError(
+                    kind=errors.UNKNOWN, message="boom", retryable=False
+                )
+                return _FakeStream(), err
+            if prompt == "block":
+                while True:
+                    await asyncio.sleep(1)
+            return _FakeStream(), None
+
+    async def main():
+        executor = _FlexExecutor()
+        events = []
+        mgr = tm.TaskManager(executor, config, on_complete=events.append)
+        try:
+            # 成功任务 → 回调收到 DONE，且 executor 收到 timeout=0（不限制）
+            rec = await mgr.submit("go", cwd="")
+            res = await mgr.wait_for(rec.task_id, max_wait_sec=10.0, interval_sec=0.1)
+            assert res["status"] == "done", res
+            for _ in range(100):
+                if events:
+                    break
+                await asyncio.sleep(0.02)
+            assert len(events) == 1 and events[0].status == tm.TaskStatus.DONE
+            assert executor.timeouts[0] == 0.0, "timeout=0 表示不限制"
+
+            # 失败任务 → 回调收到 ERROR
+            rec2 = await mgr.submit("fail", cwd="")
+            res2 = await mgr.wait_for(rec2.task_id, max_wait_sec=10.0, interval_sec=0.1)
+            assert res2["status"] == "error", res2
+            for _ in range(100):
+                if len(events) >= 2:
+                    break
+                await asyncio.sleep(0.02)
+            assert len(events) == 2 and events[1].status == tm.TaskStatus.ERROR
+
+            # 取消任务 → 不触发回调（followup 中断会另发新任务推送）
+            rec3 = await mgr.submit("block", cwd="")
+            for _ in range(200):
+                if rec3.status == tm.TaskStatus.RUNNING:
+                    break
+                await asyncio.sleep(0.02)
+            out3 = await mgr.cancel(rec3.task_id)
+            assert out3["status"] == "cancelled"
+            await asyncio.sleep(0.1)
+            assert len(events) == 2, "CANCELLED 不应触发 on_complete"
+
+            # plugin 的 execute 入口应委托给 submit（不再同步执行）
+            async def _none(*a, **k):
+                return None
+
+            plugin = pm.ClaudeCodeAdapterPlugin(None)
+            plugin._ready = True
+            plugin._config = config
+            plugin._executor = MagicMock()
+            session_mgr = MagicMock()
+            session_mgr.find_resumable = _none
+            plugin._session_mgr = session_mgr
+            plugin._provider_mgr = None
+            plugin._task_mgr = tm.TaskManager(executor, config)
+            out = await plugin.execute_entry(prompt="do something", cwd="")
+            assert isinstance(out, dict), out
+            assert out.get("task_id") and out.get("status") in (
+                "pending",
+                "running",
+            ), out
+        finally:
+            await mgr.stop()
+
+    asyncio.run(main())
+
+
+def test_running_progress_and_wait_clamp():
+    """v0.6.0：运行中 to_dict 含实时进度；wait 建议时长夹 [5,55]；工具层夹取 ≤55s。"""
+    import asyncio
+    import time
+    from unittest.mock import MagicMock
+
+    models = _load_pkg_module("models.py", "models")
+    _load_pkg_module("errors.py", "errors")
+    _load_pkg_module("parser.py", "parser")
+    _load_pkg_module("executor.py", "executor")
+    tm = _load_pkg_module("task_manager.py", "task_manager")
+    pm = _load_pkg_module("_plugin_main.py", "_plugin_main")
+
+    class _FakeParser:
+        messages = [
+            MagicMock(text=""),
+            MagicMock(text="正在修改登录表单校验逻辑"),
+        ]
+
+    class _DummyExecutor:
+        async def execute(self, invocation, parser):
+            raise AssertionError("不应被执行")
+
+    async def main():
+        config = models.AdapterConfig(command="fake-claude")
+        mgr = tm.TaskManager(_DummyExecutor(), config)
+        try:
+            # 运行中记录附带实时进度（消息数 + 最近动态）
+            rec = tm.TaskRecord(task_id="tp", prompt="p", cwd="")
+            rec.status = tm.TaskStatus.RUNNING
+            rec.started_at = time.time() - 30
+            rec._parser = _FakeParser()
+            mgr._tasks["tp"] = rec
+            data = rec.to_dict()
+            assert data["progress"]["message_count"] == 2
+            assert "登录表单" in data["progress"]["last_activity"]
+
+            # 建议的下次等待时长上限 55s（网关 ~60s ReadTimeout）
+            orig_time = tm.time.time
+            ticks = iter([1000.0, 1600.0, 2200.0, 2800.0, 3400.0, 4000.0])
+            tm.time.time = lambda: next(ticks)
+            try:
+                out = await mgr.wait_for("tp", max_wait_sec=500.0, interval_sec=0.1)
+            finally:
+                tm.time.time = orig_time
+            assert out["still_running"] is True
+            assert out["suggested_next_wait_sec"] == 55.0, out
+            assert "自动推送" in out["message"]
+
+            # claude_code_wait 工具层：max_wait_sec 被夹到 ≤55
+            class _RecMgr:
+                captured = None
+
+                async def wait_for(self, task_id, max_wait_sec=60.0, interval_sec=0.0):
+                    self.captured = max_wait_sec
+                    return {"status": "done", "task_id": task_id}
+
+            plugin = pm.ClaudeCodeAdapterPlugin(None)
+            plugin._ready = True
+            plugin._config = config
+            plugin._executor = MagicMock()
+            plugin._session_mgr = MagicMock()
+            rec_mgr = _RecMgr()
+            plugin._task_mgr = rec_mgr
+            res = await plugin.claude_code_wait(task_id="t1", max_wait_sec=3600.0)
+            assert isinstance(res, dict) and res.get("status") == "done", res
+            assert rec_mgr.captured == 55.0, "单次等待必须夹在网关超时之内"
+        finally:
+            await mgr.stop()
+
+    asyncio.run(main())
+
+
 if __name__ == "__main__":
     subprocess.run([sys.executable, "-m", "pytest", __file__, "-v"])

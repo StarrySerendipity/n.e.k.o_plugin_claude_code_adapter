@@ -1,26 +1,26 @@
 [plugin]
 name = "Claude Code Adapter"
 type = "plugin"
-description = """让猫娘指挥 Claude Code 干活的适配器插件。
+description = """让猫娘指挥 Claude Code 干活的适配器插件（全异步，专为长任务设计）。
 
 【快速上手：怎么和猫娘说】
-- 短任务（<5分钟）：直接说「用 Claude Code 帮我把 xxx 项目的 xxx 功能实现一下」，猫娘会调用 claude_code_execute 同步执行并直接回复结果。
-- 长任务：说「提交一个 Claude Code 后台任务去做 xxx」，猫娘会 submit 后自行预估耗时，用 claude_code_wait 智能等待，完成后主动汇报。
+- 执行任务：直接说「用 Claude Code 帮我把 xxx 项目的 xxx 功能实现一下」。猫娘会提交后台异步任务后立即告诉你「任务正在执行」；任务完成后插件会自动把结果推送给猫娘，她会主动来汇报——全程无超时限制，半小时到一小时以上的长任务也完全没问题。
+- 盯进度：想提前知道进展就说「Claude Code 任务跑到哪了」，猫娘会查实时进度（已输出的消息数/最近动态）告诉你。
 - 会话控制：每个 Claude Code 会话都有唯一 UUID（即工具返回的 session_id）。同一项目的多轮迭代默认自动续跑同一会话；想强制新开就说「开个新会话去做」；想接回某个历史会话，把插件面板或 claude_code_list_sessions(include_history=true) 里看到的会话 UUID 发给猫娘，说「继续这个会话：<UUID>」即可，插件会自动定位会话归属目录，无需指定路径。
 - 执行中纠正：任务跑到一半发现方向有偏差，直接跟猫娘说「让 Claude Code 改一下：xxx」，猫娘会调用 claude_code_followup 在同一会话里追加纠正指令（自动中断当前跑偏的任务，保留已有上下文续发）。
 - 供应商切换：说「切换 Claude 供应商到 xxx」即可在官方/中转/第三方端点间切换（cc-switch 风格，仅注入子进程环境变量，不改全局配置）。
 
 【工具集】
-- claude_code_execute：同步执行（上限 300s）
-- claude_code_submit / claude_code_wait / claude_code_poll / claude_code_cancel：异步任务（submit 提交 → wait 智能等待，任务一完成立即返回；超时按 suggested_next_wait_sec 续等）
+- claude_code_submit：唯一的执行入口，提交后台异步任务（无超时限制），立即返回 task_id；完成后插件自动推送结果给猫娘
+- claude_code_wait / claude_code_poll / claude_code_cancel：提前盯进度（含实时进度，单次最多 55s 可反复调用）/ 单次查询 / 取消
 - claude_code_followup：在同一会话中追加补充/纠正指令（任务执行中会自动中断当前任务后续发，已完成的会话直接续发）
 - claude_code_list_sessions / clear_session / check_health / get_config：会话与环境管理（list_sessions 支持 include_history=true 列出所有历史会话 UUID）
 - claude_code_list_providers / switch_provider / remove_provider：多供应商切换
 
 【前端面板】内置 cc-switch 风格的会话管理界面：左侧会话列表、右侧对话详情，可查看每个会话的 UUID、完整对话内容，支持一键复制 UUID 和删除会话。
 
-【注意事项】需要本机已安装 Claude Code CLI（npm install -g @anthropic-ai/claude-code）。失败时插件会自动用 session_id 续跑而非重开会话，尽量保留上下文。"""
-short_description = "让猫娘指挥 Claude Code 干活：同步/异步执行、执行中同会话追加纠正指令、基于 Claude 原生 UUID 的会话维持/新开/历史回溯、cc-switch 风格多供应商切换与会话管理面板。"
+【注意事项】需要本机已安装 Claude Code CLI（npm install -g @anthropic-ai/claude-code）。失败时插件会自动用 session_id 续跑而非重开会话，尽量保留上下文。v0.6.0 起不再提供同步执行（同步会被网关超时卡死，且 Claude Code 本就擅长长任务）。"""
+short_description = "让猫娘指挥 Claude Code 干活：全异步执行无超时限制、完成自动推送结果、执行中同会话追加纠正指令、基于 Claude 原生 UUID 的会话维持/新开/历史回溯、cc-switch 风格多供应商切换与会话管理面板。"
 keywords = [
     "claude",
     "claude-code",
@@ -36,7 +36,7 @@ keywords = [
     "provider",
     "session-manager",
 ]
-version = "0.5.0"
+version = "0.6.0"
 id = "claude_code_adapter"
 entry = "plugin.plugins.claude_code_adapter._plugin_main:ClaudeCodeAdapterPlugin"
 
@@ -91,8 +91,9 @@ effort = ""
 max_turns_per_run = 0
 # 跳过权限提示（与 Paperclip 行为一致；仅用于受信任的本地开发场景）。
 dangerously_skip_permissions = true
-# 单次执行超时（秒）。main_server 上限 300s，这里取上限。
-timeout_sec = 300
+# 单次执行超时（秒）。0 = 不限制（默认）：Claude Code 常执行半小时以上的长任务，
+# 异步后台执行不受网关调用超时影响，无需限制；仅在需要强制兜底时显式设置。
+timeout_sec = 0
 # 默认工作目录（留空 = 当前插件进程 cwd）。猫娘调用时可覆盖。
 cwd = ""
 # 附加系统提示文件路径（留空则不附加）。

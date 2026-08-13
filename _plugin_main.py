@@ -3,11 +3,12 @@
 从 __init__.py 拆分出来，保证 entry 类位于模块顶层，
 满足 neko-plugin release check 的 AST 静态校验要求。
 
+v0.6.0 全异步化：不再有同步执行入口（同步会被网关 ~60s
+ReadTimeout 卡死，且 Claude Code 常执行半小时以上的长任务）。
+
 工具集：
-- claude_code_execute: 同步执行（短任务，最长 300s）
-- claude_code_submit / claude_code_poll / claude_code_wait /
-  claude_code_cancel: 异步提交 + 智能等待/轮询模式，
-  避免 main_server 的 300 秒超时限制
+- claude_code_submit: 提交后台异步任务（无超时限制），立即返回 task_id
+- claude_code_poll / claude_code_wait / claude_code_cancel: 状态查询/提前盯/取消
 - claude_code_followup: 任务执行中/完成后在同一会话追加补充或纠正指令
   （自动中断跑偏的任务，保留上下文续发）
 - claude_code_check_health / claude_code_list_sessions /
@@ -15,8 +16,12 @@
 - claude_code_list_providers / claude_code_switch_provider /
   claude_code_remove_provider: cc-switch 风格的多供应商切换
 
+任务完成主动推送：任务到达终态时插件经 push_message 把结果注入
+对话频道（ai_behavior="respond"），猫娘自动收到并组织汇报，
+无需一直轮询；想提前盯时可用 claude_code_wait/poll（含实时进度）。
+
 会话控制（v0.4.0）：
-execute / submit 支持 session_mode（auto/new/resume）+ session_id，
+submit 支持 session_mode（auto/new/resume）+ session_id，
 让猫娘能明确指定续跑同一会话或强制新开会话。
 session_id 就是 Claude Code 原生会话 UUID（每个 Claude Code 会话唯一）：
 - resume 模式支持裸 UUID、唯一前缀、'claude --resume <uuid>' 命令形态，
@@ -41,20 +46,14 @@ from plugin.sdk.plugin import (
 )
 
 from . import claude_sessions
-from .errors import (
-    ClassifiedError,
-    is_retryable,
-)
 from .executor import (
     ClaudeCLIExecutor,
-    build_cli_invocation,
     detect_claude_cli,
 )
-from .models import AdapterConfig, ExecuteResult
-from .parser import ClaudeOutputParser
+from .models import AdapterConfig
 from .provider_manager import Provider, ProviderManager
 from .session import SessionManager, compute_prompt_signature
-from .task_manager import TaskManager, TaskStatus
+from .task_manager import TaskManager, TaskRecord, TaskStatus
 
 
 @neko_plugin
@@ -109,12 +108,13 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
             self._provider_mgr = ProviderManager(plugin_dir, logger=self.logger)
             self._provider_mgr.load()
 
-            # 6. 初始化任务管理器（异步提交 + 轮询模式）
+            # 6. 初始化任务管理器（全异步：无超时限制，完成后主动推送结果）
             self._task_mgr = TaskManager(
                 self._executor,
                 self._config,
                 logger=self.logger,
                 env_provider=self._active_provider_env,
+                on_complete=self._push_task_result,
             )
             await self._task_mgr.start()
             self.logger.info("TaskManager initialized and started")
@@ -291,282 +291,93 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
         return (record.session_id if record else ""), "", "", ""
 
     # ------------------------------------------------------------------
-    # 核心执行逻辑（内部方法，被 @llm_tool 方法调用）
+    # 任务完成主动推送（TaskManager 回调 → push_message）
     # ------------------------------------------------------------------
 
-    async def _execute_with_retry(
-        self,
-        prompt: str,
-        *,
-        cwd: str = "",
-        model: str = "",
-        effort: str = "",
-        max_turns: int = 0,
-        session_mode: str = "auto",
-        session_id: str = "",
-    ) -> ExecuteResult:
-        """执行 Claude Code 任务，支持自动重试。
+    def _push_task_result(self, record: TaskRecord) -> None:
+        """任务到达终态时把结果注入对话频道。
 
-        重试策略：
-        - auto 模式：首次尝试自动恢复会话（如果存在可恢复的会话）
-        - resume 模式：强制续跑指定 session_id，重试时仍续跑
-        - new 模式：始终新开会话
-        - 如果失败且错误可重试，auto/new 模式新建会话重试
-        - 最多重试 self._config.max_retries 次
+        用 push_message(visibility=[], ai_behavior="respond")：猫娘 LLM
+        收到结果后自然生成汇报，长任务（半小时以上）期间无需轮询。
+        被取消的任务不推送（通常是 followup 主动中断，新任务会另行推送）。
         """
-        assert self._executor is not None and self._session_mgr is not None
+        try:
+            data = record.to_dict()
+            elapsed = float(data.get("elapsed") or 0)
+            prompt_brief = (record.prompt or "").strip()
+            if len(prompt_brief) > 200:
+                prompt_brief = prompt_brief[:200] + "…"
 
-        signature = compute_prompt_signature(
-            system_prompt_file=self._config.append_system_prompt_file,
-            skills_dir=self._config.skills_dir,
-        )
-
-        # 根据会话模式解析续跑会话（resume 模式返回会话归属目录）
-        requested_cwd = (cwd or "").strip()
-        (
-            resume_id,
-            resume_cwd,
-            resume_title,
-            resolve_err,
-        ) = await self._resolve_resume_id(
-            session_mode=session_mode,
-            session_id=session_id,
-            cwd=requested_cwd,
-            signature=signature,
-        )
-        if resolve_err:
-            return ExecuteResult(
-                error_kind="invalid_argument",
-                error_message=resolve_err,
-            )
-        # 工作目录优先级：调用方显式指定 > 会话归属目录(resume) > 配置默认 > 进程 cwd
-        effective_cwd = requested_cwd or resume_cwd or self._config.cwd or os.getcwd()
-        mode = (session_mode or "auto").strip().lower() or "auto"
-
-        max_attempts = 1 + max(0, self._config.max_retries)
-        last_error: Optional[ClassifiedError] = None
-
-        for attempt in range(max_attempts):
-            is_retry = attempt > 0
-            if is_retry and mode != "resume":
-                # auto/new 模式重试时新建会话；resume 模式保持续跑
-                resume_id = ""
-                self.logger.info(
-                    "Retrying with new session (attempt {}/{}): prev_error={}",
-                    attempt + 1,
-                    max_attempts,
-                    last_error.kind if last_error else "unknown",
-                )
-
-            # 构建 CLI 调用（注入激活 provider 的环境变量）
-            invocation, build_err = build_cli_invocation(
-                self._config,
-                prompt=prompt,
-                resume_session_id=resume_id,
-                cwd=effective_cwd,
-                model=model,
-                effort=effort,
-                max_turns=max_turns,
-                extra_env=self._active_provider_env(),
-            )
-            if build_err is not None:
-                last_error = build_err
-                # CLI 未找到 — 不可重试
-                if not is_retryable(build_err.kind):
-                    return ExecuteResult(
-                        error_kind=build_err.kind,
-                        error_message=build_err.message,
+            if record.status == TaskStatus.DONE:
+                result = data.get("result") or {}
+                output = str(result.get("output") or "")
+                if len(output) > 4000:
+                    output = output[:4000] + "\n…（结果过长已截断）"
+                lines = [
+                    f"【Claude Code 任务完成】task_id={record.task_id}，耗时 {elapsed:.0f}s。"
+                ]
+                if record.session_id:
+                    lines.append(
+                        f"会话 session_id={record.session_id}（后续可用 claude_code_followup 在同一会话追加指令）"
                     )
-                continue
+                lines.append(f"任务指令：{prompt_brief}")
+                lines.append(f"执行结果：\n{output or '（无文本输出）'}")
+            else:
+                lines = [
+                    f"【Claude Code 任务失败】task_id={record.task_id}，耗时 {elapsed:.0f}s。"
+                ]
+                if record.session_id:
+                    lines.append(
+                        f"会话 session_id={record.session_id}（可用 claude_code_followup 在同一会话重试/纠正）"
+                    )
+                lines.append(f"任务指令：{prompt_brief}")
+                lines.append(f"失败原因：{record.error_message or '未知错误'}")
+            lines.append(
+                "请基于以上结果，用你自己的语气向 {MASTER_NAME} 汇报这次 Claude Code 任务的情况。"
+            )
 
-            # 执行
-            parser = ClaudeOutputParser()
-            stream, exec_err = await self._executor.execute(invocation, parser)
-
-            # 成功
-            if exec_err is None:
-                session_id = stream.session_id
-                is_new_session = not bool(resume_id)
-
-                # 更新会话记录
-                if session_id:
-                    try:
-                        await self._session_mgr.upsert(
-                            session_id, effective_cwd, signature
-                        )
-                        await self._session_mgr.touch(
-                            session_id,
-                            turn_count=stream.result.num_turns if stream.result else 0,
-                        )
-                    except Exception as e:
-                        self.logger.warning("Failed to update session record: {}", e)
-
-                # 构造结果
-                result = ExecuteResult(
-                    session_id=session_id,
-                    session_title=resume_title if resume_id else "",
-                    is_new_session=is_new_session,
-                    messages=stream.messages,
-                    final_text=stream.final_text,
-                    total_cost_usd=stream.result.total_cost_usd
-                    if stream.result
-                    else 0.0,
-                    duration_ms=stream.result.duration_ms if stream.result else 0,
-                    num_turns=stream.result.num_turns if stream.result else 0,
-                    raw_result=stream.result.raw if stream.result else {},
-                )
-                return result
-
-            # 失败 — 记录错误并判断是否重试
-            last_error = exec_err
-
-            # 标记会话错误
-            if resume_id:
-                try:
-                    await self._session_mgr.mark_error(resume_id, exec_err.kind)
-                except Exception:
-                    pass
-
-            # 不可重试 — 立即返回
-            if not is_retryable(exec_err.kind):
-                return ExecuteResult(
-                    session_id=resume_id,
-                    error_kind=exec_err.kind,
-                    error_message=exec_err.message,
-                    final_text=stream.final_text,
-                    duration_ms=stream.result.duration_ms if stream.result else 0,
-                )
-
-            # 可重试 — 继续下一轮
-            continue
-
-        # 所有重试都失败
-        return ExecuteResult(
-            error_kind=last_error.kind if last_error else "unknown",
-            error_message=last_error.message if last_error else "all retries exhausted",
-        )
+            self.push_message(
+                source="claude_code_adapter",
+                visibility=[],
+                ai_behavior="respond",
+                parts=[{"type": "text", "text": "\n".join(lines)}],
+                priority=6,
+                metadata={
+                    "kind": "claude_code_task_finished",
+                    "task_id": record.task_id,
+                    "status": record.status.value,
+                    "session_id": record.session_id,
+                    "elapsed_sec": round(elapsed, 1),
+                },
+            )
+            self.logger.info("Task result pushed to dialog: {}", record.task_id)
+        except Exception as e:
+            # 推送失败不影响任务本身；猫娘仍可用 poll 取结果
+            self.logger.warning("push task result failed: {}: {}", record.task_id, e)
 
     # ==================================================================
     # LLM 工具集（@llm_tool 装饰器注册）
     # ==================================================================
 
     @llm_tool(
-        name="claude_code_execute",
+        name="claude_code_submit",
         description=(
-            "调用 Claude Code CLI 执行编码任务。Claude Code 是一个强大的 AI 编码助手，"
+            "提交 Claude Code 编码任务到后台异步执行（唯一的执行入口，无超时限制，"
+            "适合半小时到一小时以上的长任务）。Claude Code 是一个强大的 AI 编码助手，"
             "可以读写文件、运行命令、调试代码、写测试、查文档等。\n\n"
-            "适用场景：\n"
-            "- 写新功能、新文件\n"
-            "- 修改现有代码、修 bug\n"
-            "- 运行测试、构建项目\n"
-            "- 代码审查、重构\n"
-            "- 查阅项目文档、理解代码结构\n\n"
+            "核心流程（重要）：\n"
+            "1. 调用本工具提交任务，立即返回 task_id（不阻塞）\n"
+            "2. 立刻回复用户「任务已交给 Claude Code，正在执行」之类的话，\n"
+            "   不要原地等待——任务完成后插件会自动把结果推送给你，\n"
+            "   你收到推送后再向用户汇报\n"
+            "3. 若想提前盯进度，可用 claude_code_wait（单次最多 55s，可反复调用，"
+            "   返回含实时进度）或 claude_code_poll 单次查询；取消用 claude_code_cancel\n"
+            "4. 执行中发现方向跑偏，用 claude_code_followup 在同一会话追加纠正指令\n\n"
+            "适用场景：写新功能/新文件、修改代码修 bug、运行测试构建项目、"
+            "代码审查重构、Git 操作、插件打包上传等一切编码任务。\n\n"
             "参数说明：\n"
             "- prompt: 详细描述要让 Claude Code 做什么。要具体、清晰，包含必要的上下文。\n"
             "- cwd: 工作目录（项目根目录的绝对路径）。同一目录的调用会自动复用会话上下文。\n"
-            "- model: 模型 ID（可选）。留空使用适配器默认配置。\n"
-            "- effort: 推理努力级别（可选）：'low' / 'medium' / 'high'。留空使用默认配置。\n"
-            "- max_turns: 最大轮次（可选，0=使用默认值）。\n"
-            "- session_mode: 会话控制（可选）：'auto'（默认，自动复用同目录会话）/ "
-            "'new'（强制新开会话）/ 'resume'（强制续跑 session_id 指定的会话）。\n"
-            "- session_id: 仅 session_mode='resume' 时需要。它就是 Claude Code 原生会话 UUID，"
-            "可从本工具/submit 返回的 session_id 字段、claude_code_list_sessions(include_history=true) "
-            "或插件面板获取；支持任意历史会话，插件会自动定位会话归属目录，无需同时传 cwd。\n\n"
-            "返回：包含 Claude Code 的最终回复文本、会话 ID（session_id，即 Claude Code 原生 UUID，"
-            "后续维持同一会话直接传它）、费用、轮次等信息的字典。"
-        ),
-        parameters={
-            "type": "object",
-            "properties": {
-                "prompt": {
-                    "type": "string",
-                    "description": "要交给 Claude Code 执行的任务描述。要具体、清晰，包含必要的项目上下文。",
-                },
-                "cwd": {
-                    "type": "string",
-                    "description": "工作目录（项目根目录的绝对路径）。同一目录的调用会自动复用会话上下文。留空使用适配器默认配置。",
-                },
-                "model": {
-                    "type": "string",
-                    "description": "模型 ID（可选）。例如 'sonnet' / 'opus'。留空使用默认配置。",
-                },
-                "effort": {
-                    "type": "string",
-                    "description": "推理努力级别（可选）：'low' / 'medium' / 'high'。留空使用默认配置。",
-                    "enum": ["", "low", "medium", "high"],
-                },
-                "max_turns": {
-                    "type": "integer",
-                    "description": "最大轮次（可选，0=使用默认值）。",
-                },
-                "session_mode": {
-                    "type": "string",
-                    "description": (
-                        "会话控制：'auto'（默认，自动复用）/ 'new'（强制新会话）/ "
-                        "'resume'（续跑 session_id 指定的会话，支持任意历史会话）。"
-                    ),
-                    "enum": ["", "auto", "new", "resume"],
-                },
-                "session_id": {
-                    "type": "string",
-                    "description": (
-                        "仅 session_mode='resume' 时需要：Claude Code 原生会话 UUID。"
-                        "取自之前执行返回的 session_id、claude_code_list_sessions(include_history=true) "
-                        "或插件面板；支持完整 UUID、唯一前缀或 'claude --resume <uuid>' 命令形态。"
-                    ),
-                },
-            },
-            "required": ["prompt"],
-        },
-        timeout=300.0,
-    )
-    async def claude_code_execute(
-        self,
-        prompt: str = "",
-        cwd: str = "",
-        model: str = "",
-        effort: str = "",
-        max_turns: int = 0,
-        session_mode: str = "auto",
-        session_id: str = "",
-        **_,
-    ) -> dict[str, Any]:
-        """执行 Claude Code 任务。"""
-        not_ready = self._ensure_ready()
-        if not_ready is not None:
-            return not_ready
-
-        if not prompt or not prompt.strip():
-            return Err(SdkError("prompt 不能为空"))
-
-        try:
-            result = await self._execute_with_retry(
-                prompt,
-                cwd=cwd,
-                model=model,
-                effort=effort,
-                max_turns=max_turns,
-                session_mode=session_mode,
-                session_id=session_id,
-            )
-            return Ok(result.to_llm_payload())
-        except Exception as e:
-            self.logger.exception("claude_code_execute failed")
-            return Err(SdkError(f"执行失败: {e}"))
-
-    @llm_tool(
-        name="claude_code_submit",
-        description=(
-            "提交 Claude Code 编码任务到后台异步执行。适用于耗时较长的任务，"
-            "避免 main_server 的 300 秒超时限制。\n\n"
-            "使用流程（推荐）：\n"
-            "1. 调用 claude_code_submit 提交任务，立即返回 task_id\n"
-            "2. 根据任务复杂度预估耗时，调用 claude_code_wait 智能等待\n"
-            "   （任务一完成立即返回；超时则返回进度和建议的下次等待时长）\n"
-            "3. 也可用 claude_code_poll 单次查询；如需取消用 claude_code_cancel\n\n"
-            "参数说明：\n"
-            "- prompt: 详细描述要让 Claude Code 做什么。要具体、清晰，包含必要的上下文。\n"
-            "- cwd: 工作目录（项目根目录的绝对路径）。\n"
             "- model: 模型 ID（可选）。留空使用适配器默认配置。\n"
             "- effort: 推理努力级别（可选）：'low' / 'medium' / 'high'。\n"
             "- max_turns: 最大轮次（可选，0=使用默认值）。\n"
@@ -679,8 +490,9 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
                 "task_id": record.task_id,
                 "status": record.status.value,
                 "resumed_session": resume_id,
-                "message": "任务已提交。建议根据预估耗时调用 claude_code_wait 等待结果，"
-                "或用 claude_code_poll 单次查询。",
+                "message": "任务已在后台开始执行（无超时限制）。请先回复用户「任务正在执行」，"
+                "不要原地等待；任务完成后插件会自动把结果推送给你。"
+                "想提前盯进度可反复调用 claude_code_wait（单次最多 55s，含实时进度）。",
             }
             if resume_title:
                 payload["resumed_session_title"] = resume_title
@@ -742,19 +554,18 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
     @llm_tool(
         name="claude_code_wait",
         description=(
-            "智能等待 Claude Code 异步任务完成。在插件内部自动轮询，"
-            "任务一完成立即返回结果，比反复手动调用 claude_code_poll 更高效。\n\n"
-            "使用策略（重要）：\n"
-            "- 提交任务后，先根据任务复杂度预估耗时：\n"
-            "  简单任务（单文件小改）≈30-60s；中等任务（多文件修改/写测试）≈120s；\n"
-            "  复杂任务（重构/多步骤工程）≈240s 以上\n"
-            "- 按预估耗时设置 max_wait_sec；若超时返回 still_running，\n"
-            "  按返回的 suggested_next_wait_sec 再次调用本工具即可\n\n"
+            "提前盯 Claude Code 异步任务的进度（可选工具）。在插件内部自动轮询，"
+            "任务一完成立即返回结果。注意：任务完成后插件会自动推送结果给你，"
+            "所以通常不需要一直等——本工具只用于你想提前盯进度的场景。\n\n"
+            "使用约束（重要）：\n"
+            "- 单次最多等 55 秒（受网关调用超时限制，超过会 ReadTimeout）\n"
+            "- 返回 still_running=true 时，可携带返回的 progress（实时进度：\n"
+            "  已输出消息数/最近动态）先向用户汇报进展，隔一会儿再调本工具\n\n"
             "参数说明：\n"
             "- task_id: 任务 ID（从 claude_code_submit 返回）\n"
-            "- max_wait_sec: 本次最多等待的秒数（5-290，默认 60）\n"
+            "- max_wait_sec: 本次最多等待的秒数（5-55，默认 50）\n"
             "- poll_interval: 内部轮询初始间隔秒数（可选，自适应退避，无需关心）\n\n"
-            "返回：任务完成时返回完整结果；仍在运行时返回进度、"
+            "返回：任务完成时返回完整结果；仍在运行时返回实时进度、"
             "still_running=true 和 suggested_next_wait_sec。"
         ),
         parameters={
@@ -766,7 +577,7 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
                 },
                 "max_wait_sec": {
                     "type": "number",
-                    "description": "本次最多等待的秒数（5-290）。根据预估任务耗时设置。",
+                    "description": "本次最多等待的秒数（5-55，默认 50）。受网关调用超时限制，单次不能超过 55s。",
                 },
                 "poll_interval": {
                     "type": "number",
@@ -775,16 +586,16 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
             },
             "required": ["task_id"],
         },
-        timeout=295.0,
+        timeout=60.0,
     )
     async def claude_code_wait(
         self,
         task_id: str = "",
-        max_wait_sec: float = 60.0,
+        max_wait_sec: float = 50.0,
         poll_interval: float = 0.0,
         **_,
     ) -> dict[str, Any]:
-        """智能等待任务完成。"""
+        """提前盯任务进度（任务完成后插件会自动推送，本工具非必需）。"""
         not_ready = self._ensure_ready()
         if not_ready is not None:
             return not_ready
@@ -796,8 +607,8 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
             return Err(SdkError("TaskManager not initialized"))
 
         try:
-            # 夹在安全区间：不超过 main_server 单次调用上限
-            wait_sec = max(5.0, min(290.0, float(max_wait_sec or 60.0)))
+            # 夹在安全区间：网关远程工具调用 ~60s 会 ReadTimeout，单次等待不超 55s
+            wait_sec = max(5.0, min(55.0, float(max_wait_sec or 50.0)))
             result = await self._task_mgr.wait_for(
                 task_id, max_wait_sec=wait_sec, interval_sec=float(poll_interval or 0)
             )
@@ -1036,7 +847,7 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
         description=(
             "检查 Claude Code CLI 是否可用。返回 CLI 路径、版本信息和适配器状态。\n\n"
             "适用场景：\n"
-            "- 在调用 claude_code_execute 之前确认环境就绪\n"
+            "- 在调用 claude_code_submit 之前确认环境就绪\n"
             "- 诊断 Claude Code 相关问题\n"
             "- 检查适配器配置是否正确\n\n"
             "返回：包含 cli_available、cli_path、config 等信息的字典。"
@@ -1103,7 +914,7 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
             "适用场景：\n"
             "- 查看当前有哪些活跃的 Claude Code 会话\n"
             "- include_history=true：找回历史会话的 UUID，配合 "
-            "claude_code_execute(session_mode='resume', session_id=<UUID>) 回到该会话的上下文\n\n"
+            "claude_code_submit(session_mode='resume', session_id=<UUID>) 回到该会话的上下文\n\n"
             "返回：包含 sessions 列表的字典，每个会话含 session_id（Claude Code 原生 UUID）、"
             "cwd、turn_count 等字段；历史会话额外含 title、resume_command。"
         ),
@@ -1253,7 +1064,7 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
             "适用场景：\n"
             "- 了解默认模型、超时、工作目录等设置\n"
             "- 诊断配置问题\n"
-            "- 在调用 claude_code_execute 前确认参数默认值\n\n"
+            "- 在调用 claude_code_submit 前确认参数默认值\n\n"
             "返回：包含完整适配器配置的字典。"
         ),
         parameters={
@@ -1310,7 +1121,7 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
         name="claude_code_switch_provider",
         description=(
             "切换 Claude Code 的 API 供应商（cc-switch 风格）。切换后对后续所有\n"
-            "claude_code_execute / claude_code_submit 调用生效，不影响已在运行的任务。\n\n"
+            "claude_code_submit 调用生效，不影响已在运行的任务。\n\n"
             "参数说明：\n"
             "- name: 供应商名称（从 claude_code_list_providers 获取）。\n"
             "  传空字符串表示清除激活状态，回退到用户全局 ~/.claude 配置。\n"
@@ -1444,8 +1255,8 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
     @plugin_entry(
         id="execute",
         name="执行 Claude Code 任务",
-        description="执行 Claude Code 任务（与 claude_code_execute LLM 工具相同的功能，供 UI/其他插件调用）。",
-        llm_result_fields=["output", "session_id", "num_turns"],
+        description="提交 Claude Code 任务到后台异步执行（v0.6.0 起全异步，与 claude_code_submit 相同），立即返回 task_id，完成后自动推送结果。",
+        llm_result_fields=["task_id", "status"],
         input_schema={
             "type": "object",
             "properties": {
@@ -1477,28 +1288,16 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
         session_id: str = "",
         **_,
     ) -> Any:
-        """插件入口（与 LLM 工具功能相同，供 UI/其他插件调用）。"""
-        not_ready = self._ensure_ready()
-        if not_ready is not None:
-            return not_ready
-
-        if not prompt or not prompt.strip():
-            return Err(SdkError("prompt 不能为空"))
-
-        try:
-            result = await self._execute_with_retry(
-                prompt,
-                cwd=cwd,
-                model=model,
-                effort=effort,
-                max_turns=max_turns,
-                session_mode=session_mode,
-                session_id=session_id,
-            )
-            return Ok(result.to_llm_payload())
-        except Exception as e:
-            self.logger.exception("execute_entry failed")
-            return Err(SdkError(f"执行失败: {e}"))
+        """插件入口（全异步：委托 claude_code_submit，供 UI/其他插件调用）。"""
+        return await self.claude_code_submit(
+            prompt=prompt,
+            cwd=cwd,
+            model=model,
+            effort=effort,
+            max_turns=max_turns,
+            session_mode=session_mode,
+            session_id=session_id,
+        )
 
     @plugin_entry(
         id="submit_task",

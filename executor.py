@@ -303,11 +303,14 @@ class ClaudeCLIExecutor:
                 except Exception:
                     pass
 
-        # 等待进程结束（带超时）
+        # 等待进程结束（timeout <= 0 表示不限制，长任务常见半小时以上）
         try:
-            return_code = await asyncio.wait_for(
-                proc.wait(), timeout=invocation.timeout
-            )
+            if invocation.timeout and invocation.timeout > 0:
+                return_code = await asyncio.wait_for(
+                    proc.wait(), timeout=invocation.timeout
+                )
+            else:
+                return_code = await proc.wait()
         except asyncio.TimeoutError:
             # 超时 — 杀死进程
             try:
