@@ -9,6 +9,8 @@
   异步提交 + 轮询模式，避免 main_server 的 300 秒超时限制
 - claude_code_check_health / claude_code_list_sessions /
   claude_code_clear_session / claude_code_get_config: 辅助工具
+- claude_code_list_providers / claude_code_switch_provider /
+  claude_code_remove_provider: cc-switch 风格的多供应商切换
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ from .executor import (
 )
 from .models import AdapterConfig, ExecuteResult
 from .parser import ClaudeOutputParser
+from .provider_manager import Provider, ProviderManager
 from .session import SessionManager, compute_prompt_signature
 from .task_manager import TaskManager
 
@@ -61,6 +64,7 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
         self._executor: Optional[ClaudeCLIExecutor] = None
         self._session_mgr: Optional[SessionManager] = None
         self._task_mgr: Optional[TaskManager] = None
+        self._provider_mgr: Optional[ProviderManager] = None
         self._ready: bool = False
 
     # ------------------------------------------------------------------
@@ -88,23 +92,32 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
             # 4. 初始化执行器
             self._executor = ClaudeCLIExecutor(self._config, logger=self.logger)
 
-            # 5. 初始化任务管理器（异步提交 + 轮询模式）
+            # 5. 初始化供应商管理器（cc-switch 风格多供应商切换）
+            plugin_dir = os.path.dirname(os.path.abspath(__file__))
+            self._provider_mgr = ProviderManager(plugin_dir, logger=self.logger)
+            self._provider_mgr.load()
+
+            # 6. 初始化任务管理器（异步提交 + 轮询模式）
             self._task_mgr = TaskManager(
-                self._executor, self._config, logger=self.logger
+                self._executor,
+                self._config,
+                logger=self.logger,
+                env_provider=self._active_provider_env,
             )
             await self._task_mgr.start()
             self.logger.info("TaskManager initialized and started")
 
-            # 6. 检测 Claude CLI 是否可用
+            # 7. 检测 Claude CLI 是否可用
             cli_path = self._config.command or detect_claude_cli()
             cli_available = bool(cli_path)
 
             self._ready = True
             self.logger.info(
-                "ClaudeCodeAdapter started: cli_available={} model={!r} cwd={!r}",
+                "ClaudeCodeAdapter started: cli_available={} model={!r} cwd={!r} provider={!r}",
                 cli_available,
                 self._config.model,
                 self._config.cwd or os.getcwd(),
+                self._provider_mgr.get_active_name() or "(default)",
             )
 
             return Ok(
@@ -113,6 +126,7 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
                     "cli_available": cli_available,
                     "cli_path": cli_path or "",
                     "model": self._config.model,
+                    "active_provider": self._provider_mgr.get_active_name(),
                     "sessions_loaded": len(self._session_mgr._sessions)
                     if self._session_mgr
                     else 0,
@@ -163,6 +177,15 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
             return Err(SdkError("Claude Code Adapter internal state invalid"))
         return None
 
+    def _active_provider_env(self) -> dict[str, str]:
+        """返回激活 provider 的环境变量覆盖（供执行链路注入）。"""
+        if self._provider_mgr is None:
+            return {}
+        try:
+            return self._provider_mgr.env_overrides()
+        except Exception:
+            return {}
+
     # ------------------------------------------------------------------
     # 核心执行逻辑（内部方法，被 @llm_tool 方法调用）
     # ------------------------------------------------------------------
@@ -210,7 +233,7 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
                     last_error.kind if last_error else "unknown",
                 )
 
-            # 构建 CLI 调用
+            # 构建 CLI 调用（注入激活 provider 的环境变量）
             invocation, build_err = build_cli_invocation(
                 self._config,
                 prompt=prompt,
@@ -219,6 +242,7 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
                 model=model,
                 effort=effort,
                 max_turns=max_turns,
+                extra_env=self._active_provider_env(),
             )
             if build_err is not None:
                 last_error = build_err
@@ -728,10 +752,172 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
                     "config": self._config.to_dict(),
                     "ready": self._ready,
                     "default_cwd": self._config.cwd or os.getcwd(),
+                    "active_provider": self._provider_mgr.get_active_name()
+                    if self._provider_mgr
+                    else "",
                 }
             )
         except Exception as e:
             return Err(SdkError(f"获取配置失败: {e}"))
+
+    @llm_tool(
+        name="claude_code_list_providers",
+        description=(
+            "列出所有已注册的 Claude Code 供应商（API 提供方），并标出当前激活项。\n\n"
+            "供应商决定 Claude Code 走哪个 API 端点（官方 Anthropic / 第三方中转 / "
+            "OpenRouter 等），切换后对后续所有执行生效。\n\n"
+            "返回：包含 providers 列表（token 已打码）和 active_provider 的字典。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {},
+        },
+        timeout=5.0,
+    )
+    async def claude_code_list_providers(self, **_) -> dict[str, Any]:
+        """列出所有供应商。"""
+        try:
+            assert self._provider_mgr is not None
+            return Ok(
+                {
+                    "active_provider": self._provider_mgr.get_active_name(),
+                    "providers": self._provider_mgr.list_providers(),
+                }
+            )
+        except Exception as e:
+            self.logger.exception("claude_code_list_providers failed")
+            return Err(SdkError(f"列出供应商失败: {e}"))
+
+    @llm_tool(
+        name="claude_code_switch_provider",
+        description=(
+            "切换 Claude Code 的 API 供应商（cc-switch 风格）。切换后对后续所有\n"
+            "claude_code_execute / claude_code_submit 调用生效，不影响已在运行的任务。\n\n"
+            "参数说明：\n"
+            "- name: 供应商名称（从 claude_code_list_providers 获取）。\n"
+            "  传空字符串表示清除激活状态，回退到用户全局 ~/.claude 配置。\n"
+            "- base_url: （可选）新供应商的 API 端点。传入后会先注册/更新该供应商再激活。\n"
+            "- auth_token: （可选）新供应商的认证 token。\n"
+            "- display_name: （可选）展示名称。\n\n"
+            "返回：包含 active_provider 和生效环境变量的字典。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "供应商名称（小写标识）。传空字符串清除激活状态。",
+                },
+                "base_url": {
+                    "type": "string",
+                    "description": "API 端点（如 https://api.anthropic.com）。传入后会先注册/更新再激活。",
+                },
+                "auth_token": {
+                    "type": "string",
+                    "description": "认证 token（ANTHROPIC_AUTH_TOKEN）。可选。",
+                },
+                "display_name": {
+                    "type": "string",
+                    "description": "展示名称。可选。",
+                },
+            },
+            "required": ["name"],
+        },
+        timeout=5.0,
+    )
+    async def claude_code_switch_provider(
+        self,
+        name: str = "",
+        base_url: str = "",
+        auth_token: str = "",
+        display_name: str = "",
+        **_,
+    ) -> dict[str, Any]:
+        """切换/注册供应商。"""
+        if self._provider_mgr is None:
+            return Err(SdkError("ProviderManager not initialized"))
+
+        try:
+            key = name.strip().lower()
+
+            # 携带新配置 → 先注册/更新
+            if key and (base_url or auth_token):
+                env: dict[str, str] = {}
+                if base_url.strip():
+                    env["ANTHROPIC_BASE_URL"] = base_url.strip()
+                if auth_token.strip():
+                    env["ANTHROPIC_AUTH_TOKEN"] = auth_token.strip()
+                self._provider_mgr.add_or_update(
+                    Provider(name=key, display_name=display_name, env=env)
+                )
+
+            provider = self._provider_mgr.set_active(key)
+            return Ok(
+                {
+                    "active_provider": self._provider_mgr.get_active_name(),
+                    "display_name": provider.display_name or provider.name,
+                    "env": {
+                        k: (v[:4] + "****" if "TOKEN" in k or "KEY" in k else v)
+                        for k, v in self._provider_mgr.env_overrides().items()
+                    },
+                    "message": "供应商已切换，对后续执行生效"
+                    if key
+                    else "已回退到用户全局配置",
+                }
+            )
+        except KeyError:
+            return Err(
+                SdkError(
+                    f"供应商不存在: {name}。请先用 claude_code_list_providers 查看，"
+                    "或传入 base_url/auth_token 注册新供应商。"
+                )
+            )
+        except Exception as e:
+            self.logger.exception("claude_code_switch_provider failed")
+            return Err(SdkError(f"切换供应商失败: {e}"))
+
+    @llm_tool(
+        name="claude_code_remove_provider",
+        description=(
+            "删除已注册的 Claude Code 供应商。\n\n"
+            "参数说明：\n"
+            "- name: 要删除的供应商名称。\n\n"
+            "返回：包含 deleted 布尔值的字典。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "要删除的供应商名称。",
+                },
+            },
+            "required": ["name"],
+        },
+        timeout=5.0,
+    )
+    async def claude_code_remove_provider(self, name: str = "", **_) -> dict[str, Any]:
+        """删除供应商。"""
+        if self._provider_mgr is None:
+            return Err(SdkError("ProviderManager not initialized"))
+
+        if not name or not name.strip():
+            return Err(SdkError("name 不能为空"))
+
+        try:
+            deleted = self._provider_mgr.remove(name)
+            if not deleted:
+                return Err(SdkError(f"供应商不存在: {name}"))
+            return Ok(
+                {
+                    "deleted": True,
+                    "name": name.strip().lower(),
+                    "active_provider": self._provider_mgr.get_active_name(),
+                }
+            )
+        except Exception as e:
+            self.logger.exception("claude_code_remove_provider failed")
+            return Err(SdkError(f"删除供应商失败: {e}"))
 
     # ==================================================================
     # 插件入口（供 UI / 其他插件调用，非 LLM 工具）

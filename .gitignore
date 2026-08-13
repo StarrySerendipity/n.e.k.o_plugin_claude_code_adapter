@@ -43,3 +43,7 @@ Thumbs.db
 data/
 logs/
 .cache/
+
+# Provider 注册表含真实 token，禁止提交（providers.example.json 除外）
+providers.json
+providers.json.tmp

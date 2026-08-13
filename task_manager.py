@@ -87,10 +87,12 @@ class TaskManager:
     - 并发控制（最多同时 2 个任务）
     """
 
-    def __init__(self, executor, config, *, logger=None):
+    def __init__(self, executor, config, *, logger=None, env_provider=None):
         self._executor = executor
         self._config = config
         self.logger = logger or logging.getLogger(__name__)
+        # env_provider: 无参 callable，返回激活 provider 的环境变量覆盖
+        self._env_provider = env_provider
         self._tasks: Dict[str, TaskRecord] = {}
         self._lock = asyncio.Lock()
         self._cleanup_task: Optional[asyncio.Task] = None
@@ -219,7 +221,8 @@ class TaskManager:
             record.status = TaskStatus.RUNNING
             record.started_at = time.time()
 
-            # 构建 CLI 调用
+            # 构建 CLI 调用（注入激活 provider 的环境变量，提交时取值）
+            extra_env = self._env_provider() if callable(self._env_provider) else {}
             invocation, build_err = build_cli_invocation(
                 self._config,
                 prompt=record.prompt,
@@ -227,6 +230,7 @@ class TaskManager:
                 model=record.model,
                 effort=record.effort,
                 max_turns=record.max_turns,
+                extra_env=extra_env,
             )
 
             if build_err:

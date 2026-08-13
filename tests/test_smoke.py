@@ -131,5 +131,71 @@ def test_session_importable():
     assert hasattr(session_mod, "SessionManager")
 
 
+def test_provider_manager_importable():
+    """测试 provider_manager 模块可以独立导入（纯标准库，无相对导入）。"""
+    import importlib.util
+
+    root = Path(__file__).parent.parent
+    spec = importlib.util.spec_from_file_location(
+        "provider_manager", root / "provider_manager.py"
+    )
+    assert spec is not None, "provider_manager.py should be loadable"
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["provider_manager"] = mod
+    spec.loader.exec_module(mod)
+    assert hasattr(mod, "Provider")
+    assert hasattr(mod, "ProviderManager")
+    assert hasattr(mod, "ALLOWED_ENV_KEYS")
+
+
+def test_provider_manager_switch_and_mask(tmp_path):
+    """测试供应商注册/切换/打码/认证键互斥逻辑。"""
+    import importlib.util
+
+    root = Path(__file__).parent.parent
+    spec = importlib.util.spec_from_file_location(
+        "provider_manager_t2", root / "provider_manager.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["provider_manager_t2"] = mod
+    spec.loader.exec_module(mod)
+
+    mgr = mod.ProviderManager(str(tmp_path))
+
+    # 注册带双认证键的 provider
+    mgr.add_or_update(
+        mod.Provider(
+            name="relay",
+            display_name="中转",
+            env={
+                "ANTHROPIC_BASE_URL": "https://relay.example.com",
+                "ANTHROPIC_AUTH_TOKEN": "sk-secret-token-12345",
+                "ANTHROPIC_API_KEY": "sk-ant-other",
+            },
+        )
+    )
+    mgr.set_active("relay")
+
+    # 认证键互斥：只保留 AUTH_TOKEN
+    env = mgr.env_overrides()
+    assert env["ANTHROPIC_BASE_URL"] == "https://relay.example.com"
+    assert "ANTHROPIC_AUTH_TOKEN" in env
+    assert "ANTHROPIC_API_KEY" not in env
+
+    # 列表打码
+    listed = mgr.list_providers()
+    assert listed[0]["active"] is True
+    assert "sk-secret-token-12345" not in str(listed[0]["env"])
+
+    # 持久化：新实例能读回激活状态
+    mgr2 = mod.ProviderManager(str(tmp_path))
+    mgr2.load()
+    assert mgr2.get_active_name() == "relay"
+
+    # 清除激活 → 空覆盖
+    mgr.set_active("")
+    assert mgr.env_overrides() == {}
+
+
 if __name__ == "__main__":
     subprocess.run([sys.executable, "-m", "pytest", __file__, "-v"])

@@ -86,8 +86,15 @@ def build_cli_invocation(
     model: str = "",
     effort: str = "",
     max_turns: int = 0,
+    extra_env: Optional[dict[str, str]] = None,
 ) -> tuple[CLIInvocation, Optional[ClassifiedError]]:
     """构建一次 Claude CLI 调用。
+
+    Parameters
+    ----------
+    extra_env:
+        额外注入的环境变量（如激活 provider 的 ANTHROPIC_BASE_URL /
+        ANTHROPIC_AUTH_TOKEN 等，参考 cc-switch 的供应商切换思路）。
 
     Returns
     -------
@@ -161,6 +168,7 @@ def build_cli_invocation(
         cwd=effective_cwd,
         stdin_data=prompt.encode("utf-8"),
         timeout=float(config.timeout_sec),
+        env_overrides=dict(extra_env or {}),
     )
     return invocation, None
 

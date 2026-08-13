@@ -15,7 +15,7 @@ keywords = [
     "catgirl",
     "猫娘",
 ]
-version = "0.1.0"
+version = "0.2.0"
 id = "claude_code_adapter"
 entry = "plugin.plugins.claude_code_adapter._plugin_main:ClaudeCodeAdapterPlugin"
 
