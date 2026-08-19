@@ -6,6 +6,18 @@ v0.6.0 起插件全异步化：所有执行一律后台任务，无超时限制
 任务完成后通过 on_complete 回调主动推送结果给调用方（插件
 再经 push_message 注入对话频道，猫娘无需一直轮询）。
 
+v0.7.0 会话与轮询机制：
+- 每个会话以 Claude Code 原生 UUID 为唯一标识（session_id 即 UUID）。
+  新会话 UUID 由 CLI init 事件返回，submit 经 wait_session_id 短暂等待
+  捕获后立即回传猫娘；resume 会话 UUID 提交时已知，立即返回。
+- 最多同时 2 个活跃会话（_max_concurrent=2），与 CC 进程一一对应；
+  list_active 暴露活跃列表，clear_all/clear_one 清理（杀 CC 进程）。
+- 内置 _poll_loop 轮询安全网（默认 5 分钟，可调）：按各任务自身
+  poll_interval_sec 周期检测，若已结束且未推送则补推，确保结果稳定送达。
+  on_complete 立即推送为主路径，_poll_loop 为安全网，_pushed 去重绝不重复。
+- 插件重启后 _tasks 内存态为空，配合插件主类清空 SessionManager 持久化
+  索引，确保不会在用户不知情下静默续跑旧会话。
+
 其他能力：
 - 失败时自动用 session_id 续跑（--resume）而非重开新会话
 - wait_for 智能等待（自适应间隔），供猫娘想提前盯时使用
@@ -27,6 +39,20 @@ from .models import ExecuteResult
 from .parser import ClaudeOutputParser
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# 轮询安全网常量
+# ---------------------------------------------------------------------------
+DEFAULT_POLL_INTERVAL = 300.0
+"""默认轮询间隔（秒）= 5 分钟。猫娘可用 claude_code_set_poll_interval 调整，
+或在每次提交/追加指令时传 poll_interval_sec 按预期任务时长覆盖。"""
+
+MIN_POLL_INTERVAL = 15.0
+"""轮询间隔下限（秒）。过短会让安全网空转，夹到 15s。"""
+
+POLL_TICK = 30.0
+"""_poll_loop 唤醒粒度（秒）。每 30s 遍历一次任务，按各任务自身 poll_interval_sec
+判断是否到达轮询周期，避免为每个任务各起一个定时器。"""
 
 
 class TaskStatus(str, Enum):
@@ -59,6 +85,20 @@ class TaskRecord:
     error_message: Optional[str] = None
     _task: Optional[asyncio.Task] = field(default=None, repr=False)
     _parser: Optional[Any] = field(default=None, repr=False)  # 运行中实时进度来源
+    poll_interval_sec: float = 300.0
+    """该任务的轮询间隔（秒）。完成推送安全网的检查周期，默认 5 分钟。
+
+    猫娘可在提交/追加指令时按预期任务时长调整（短任务设短、长任务设长），
+    不传则用插件默认值（可用 claude_code_set_poll_interval 调整默认）。
+    """
+    _pushed: bool = field(default=False, repr=False)
+    """完成结果是否已推送给猫娘。
+
+    on_complete 立即推送与 _poll_loop 安全网共用此标记去重，
+    确保同一任务的结果只推送一次（除非首次推送失败回退重试）。
+    """
+    _last_poll_at: float = field(default_factory=time.time, repr=False)
+    """上次轮询检查时间戳。_poll_loop 据此判断是否到达该任务的轮询周期。"""
 
     def to_dict(self) -> Dict[str, Any]:
         """转换为字典（用于返回给调用方）"""
@@ -72,6 +112,7 @@ class TaskRecord:
             "status": self.status.value,
             "created_at": self.created_at,
             "elapsed": round(elapsed, 2),
+            "poll_interval_sec": self.poll_interval_sec,
         }
 
         if self.session_id:
@@ -138,14 +179,18 @@ class TaskManager:
         self._tasks: Dict[str, TaskRecord] = {}
         self._lock = asyncio.Lock()
         self._cleanup_task: Optional[asyncio.Task] = None
-        self._max_concurrent = 3  # 最大并发任务数
+        self._poll_task: Optional[asyncio.Task] = None
+        self._max_concurrent = 2  # 猫娘最多同时管理 2 个会话（与 CC 进程一一对应）
         self._result_ttl = 3600  # 结果保留时间（秒）：长任务完成后猫娘可能过一阵才来取
+        self._default_poll_interval = DEFAULT_POLL_INTERVAL  # 默认轮询间隔，可被 claude_code_set_poll_interval 调整
 
     async def start(self):
-        """启动清理任务"""
+        """启动清理任务与轮询安全网"""
         if self._cleanup_task is None:
             self._cleanup_task = asyncio.create_task(self._cleanup_loop())
-            self.logger.info("TaskManager started")
+        if self._poll_task is None:
+            self._poll_task = asyncio.create_task(self._poll_loop())
+            self.logger.info("TaskManager started (poll_interval=%ss)", self._default_poll_interval)
 
     async def stop(self):
         """停止所有任务"""
@@ -157,6 +202,15 @@ class TaskManager:
             except asyncio.CancelledError:
                 pass
             self._cleanup_task = None
+
+        # 取消轮询安全网
+        if self._poll_task:
+            self._poll_task.cancel()
+            try:
+                await self._poll_task
+            except asyncio.CancelledError:
+                pass
+            self._poll_task = None
 
         # 取消所有未完成任务（PENDING 在队列中、RUNNING 在执行中，
         # 都必须取消，避免插件关闭后留下无人管控的 CLI 进程）
@@ -183,6 +237,7 @@ class TaskManager:
         effort: str = "",
         max_turns: int = 0,
         resume_session_id: str = "",
+        poll_interval_sec: float = 0.0,
     ) -> TaskRecord:
         """
         提交任务到后台执行
@@ -192,19 +247,32 @@ class TaskManager:
         resume_session_id:
             由调用方（插件主类）根据 session_mode 预先解析：
             非空时任务会以 ``--resume <id>`` 续跑该会话；空则新开会话。
+        poll_interval_sec:
+            本任务的轮询安全网间隔（秒）。>0 时覆盖默认值；
+            <=0 时用 self._default_poll_interval。最终夹到 >= MIN_POLL_INTERVAL。
 
         Returns:
             TaskRecord: 任务记录（包含 task_id 和初始状态）
         """
         # 在锁内检查并发限制并创建任务记录
         async with self._lock:
-            running_count = sum(
-                1 for t in self._tasks.values() if t.status == TaskStatus.RUNNING
+            active_count = sum(
+                1
+                for t in self._tasks.values()
+                if t.status in (TaskStatus.PENDING, TaskStatus.RUNNING)
             )
-            if running_count >= self._max_concurrent:
+            if active_count >= self._max_concurrent:
                 raise RuntimeError(
-                    f"已达到最大并发任务数 {self._max_concurrent}，请等待现有任务完成后再提交"
+                    f"已达到最大并发会话数 {self._max_concurrent}（猫娘最多同时管理两个会话），"
+                    "请等待现有任务完成或用 claude_code_clear_session 清理后再提交"
                 )
+
+            pi = (
+                poll_interval_sec
+                if poll_interval_sec and poll_interval_sec > 0
+                else self._default_poll_interval
+            )
+            pi = max(MIN_POLL_INTERVAL, float(pi))
 
             task_id = str(uuid.uuid4())[:8]
             record = TaskRecord(
@@ -216,14 +284,124 @@ class TaskManager:
                 max_turns=max_turns,
                 resume_session_id=resume_session_id,
                 status=TaskStatus.PENDING,
+                poll_interval_sec=pi,
             )
             self._tasks[task_id] = record
 
         # 在锁外启动后台任务，避免死锁
         record._task = asyncio.create_task(self._execute_task(record))
-        self.logger.info(f"Task submitted: {task_id}")
+        self.logger.info(f"Task submitted: {task_id} (poll_interval={pi}s)")
 
         return record
+
+    async def wait_session_id(
+        self, task_id: str, timeout: float = 8.0
+    ) -> str:
+        """等待新会话的 UUID 被 CLI init 事件捕获。
+
+        新会话的 UUID 由 Claude CLI 在启动后通过 system/init 事件返回，
+        无法在提交前预知。本方法在 ``timeout`` 内轮询 record.session_id，
+        捕获到立即返回（通常 1-3s）；超时返回空串（调用方应提示猫娘用
+        claude_code_poll(task_id) 稍后取）。
+
+        resume 会话的 UUID 提交时已知（=resume_session_id），调用方无需等待。
+        """
+        deadline = time.time() + max(0.5, timeout)
+        while time.time() < deadline:
+            async with self._lock:
+                rec = self._tasks.get(task_id)
+                if rec is None:
+                    return ""
+                if rec.session_id:
+                    return rec.session_id
+                # 任务在 init 到达前就失败/取消 → 不再等
+                if rec.status in (TaskStatus.ERROR, TaskStatus.CANCELLED):
+                    return rec.session_id or ""
+            await asyncio.sleep(0.15)
+        return ""
+
+    def list_active(self) -> List[Dict[str, Any]]:
+        """返回活跃任务（PENDING/RUNNING）的状态列表。
+
+        活跃任务与正在执行的 Claude Code 子进程一一对应，即猫娘可见的
+        「会话列表」。已完成/失败的任务不在其中（完成后即从列表释放，
+        猫娘仍可用同一 UUID 继续维持会话并再次进入列表）。
+        """
+        # 快照后处理，避免持锁；_reconcile_stuck_record 只读改 record 字段
+        records = [
+            r
+            for r in list(self._tasks.values())
+            if r.status in (TaskStatus.PENDING, TaskStatus.RUNNING)
+        ]
+        for r in records:
+            self._reconcile_stuck_record(r)
+        return [r.to_dict() for r in records]
+
+    async def clear_all(self) -> Dict[str, Any]:
+        """清理整个会话列表：取消所有活跃任务（杀掉对应 CC 进程树）并清空列表。
+
+        对应「猫娘清理会话列表 → Claude Code 同一会话进程关闭」。
+        已完成的结果一并清除（猫娘通常已收到完成推送）。
+        """
+        cancelled: List[str] = []
+        async with self._lock:
+            records = list(self._tasks.values())
+            self._tasks.clear()
+
+        for record in records:
+            if record.status in (TaskStatus.PENDING, TaskStatus.RUNNING) and record._task:
+                record._task.cancel()
+                cancelled.append(record.task_id)
+                try:
+                    await record._task
+                except (asyncio.CancelledError, Exception):
+                    pass
+        self.logger.info("Cleared all sessions: {} active cancelled", len(cancelled))
+        return {"cleared_count": len(records), "cancelled_active": len(cancelled)}
+
+    async def clear_one(self, task_id: str) -> Dict[str, Any]:
+        """清理指定任务：取消并从列表释放（杀掉对应 CC 进程）。"""
+        async with self._lock:
+            record = self._tasks.pop(task_id, None)
+        if record is None:
+            return {"error": f"Task not found: {task_id}"}
+        cancelled = False
+        if record.status in (TaskStatus.PENDING, TaskStatus.RUNNING) and record._task:
+            record._task.cancel()
+            cancelled = True
+            try:
+                await record._task
+            except (asyncio.CancelledError, Exception):
+                pass
+        return {"task_id": task_id, "cancelled": cancelled, "status": record.status.value}
+
+    def set_poll_interval(
+        self,
+        *,
+        task_id: str = "",
+        interval_sec: float = 0.0,
+        default: float = 0.0,
+    ) -> Dict[str, Any]:
+        """调整轮询间隔：可改默认值、单个任务、或两者。
+
+        - default > 0：更新插件默认轮询间隔（影响后续新任务）
+        - task_id 非空 + interval_sec > 0：仅改该任务（运行中也即时生效）
+        """
+        result: Dict[str, Any] = {}
+        if default and default > 0:
+            self._default_poll_interval = max(MIN_POLL_INTERVAL, float(default))
+            result["default_poll_interval_sec"] = self._default_poll_interval
+        if task_id:
+            record = self._tasks.get(task_id)
+            if record is None:
+                return {"error": f"Task not found: {task_id}"}
+            if interval_sec and interval_sec > 0:
+                record.poll_interval_sec = max(MIN_POLL_INTERVAL, float(interval_sec))
+                result["task_id"] = task_id
+                result["poll_interval_sec"] = record.poll_interval_sec
+            else:
+                return {"error": "interval_sec 必须 > 0"}
+        return result or {"default_poll_interval_sec": self._default_poll_interval}
 
     async def poll(self, task_id: str) -> Dict[str, Any]:
         """
@@ -401,12 +579,22 @@ class TaskManager:
             self._fire_complete(record)
 
     def _fire_complete(self, record: TaskRecord) -> None:
-        """触发完成回调（推送结果给猫娘）。回调异常不影响任务本身。"""
-        if self._on_complete is None:
+        """触发完成回调（推送结果给猫娘）。
+
+        幂等：用 _pushed 去重，确保 on_complete 立即推送与 _poll_loop
+        安全网不会对同一任务重复推送。回调异常时回退 _pushed，让安全网
+        下个周期重试。
+        """
+        if record._pushed:
             return
+        if self._on_complete is None:
+            record._pushed = True
+            return
+        record._pushed = True
         try:
             self._on_complete(record)
         except Exception as e:
+            record._pushed = False  # 推送失败，回退让安全网重试
             self.logger.warning(f"on_complete callback failed: {record.task_id}: {e}")
 
     async def _run_once(self, record: TaskRecord, resume_id: str):
@@ -463,6 +651,37 @@ class TaskManager:
             while True:
                 await asyncio.sleep(60)  # 每分钟检查一次
                 await self._cleanup_expired()
+        except asyncio.CancelledError:
+            pass
+
+    async def _poll_loop(self):
+        """轮询安全网：按各任务自身的 poll_interval_sec 周期检测会话是否仍在进行。
+
+        - 任务完成时 on_complete 会立即推送结果给猫娘（主路径，"及时"）。
+        - 本循环作为安全网：到达某任务轮询周期时，若该任务已结束但尚未推送
+          （on_complete 因故未送达），则补推一次，确保结果必定稳定送达猫娘。
+        - 推送通过 _fire_complete 的 _pushed 去重，绝不重复推送。
+        - 轮询间隔默认 5 分钟，可用 claude_code_set_poll_interval 或提交时的
+          poll_interval_sec 调整（短任务设短、长任务设长）。
+        """
+        try:
+            while True:
+                await asyncio.sleep(POLL_TICK)
+                now = time.time()
+                due_records: list[TaskRecord] = []
+                async with self._lock:
+                    for record in self._tasks.values():
+                        if (now - record._last_poll_at) < record.poll_interval_sec:
+                            continue
+                        record._last_poll_at = now
+                        if record.status in (
+                            TaskStatus.DONE,
+                            TaskStatus.ERROR,
+                        ) and not record._pushed:
+                            due_records.append(record)
+                # 在锁外触发推送（_fire_complete 内部用 _pushed 去重）
+                for record in due_records:
+                    self._fire_complete(record)
         except asyncio.CancelledError:
             pass
 

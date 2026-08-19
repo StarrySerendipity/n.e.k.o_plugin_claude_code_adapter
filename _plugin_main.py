@@ -7,18 +7,23 @@ v0.6.0 全异步化：不再有同步执行入口（同步会被网关 ~60s
 ReadTimeout 卡死，且 Claude Code 常执行半小时以上的长任务）。
 
 工具集：
-- claude_code_submit: 提交后台异步任务（无超时限制），立即返回 task_id
+- claude_code_submit: 提交后台异步任务（无超时限制），立即返回 task_id + session_id
+  （新会话短暂等待 CLI init 捕获 UUID，resume 会话立即返回）
 - claude_code_poll / claude_code_wait / claude_code_cancel: 状态查询/提前盯/取消
 - claude_code_followup: 任务执行中/完成后在同一会话追加补充或纠正指令
   （自动中断跑偏的任务，保留上下文续发）
+- claude_code_list_tasks: 列出活跃会话/任务（与 CC 进程一一对应，最多 2 个）
+- claude_code_clear_session: 清理会话列表（取消活跃任务+杀 CC 进程，支持定向/全清）
+- claude_code_set_poll_interval: 调整轮询安全网间隔（默认 5 分钟，可改默认/单任务）
 - claude_code_check_health / claude_code_list_sessions /
-  claude_code_clear_session / claude_code_get_config: 辅助工具
+  claude_code_get_config: 辅助工具
 - claude_code_list_providers / claude_code_switch_provider /
   claude_code_remove_provider: cc-switch 风格的多供应商切换
 
 任务完成主动推送：任务到达终态时插件经 push_message 把结果注入
 对话频道（ai_behavior="respond"），猫娘自动收到并组织汇报，
 无需一直轮询；想提前盯时可用 claude_code_wait/poll（含实时进度）。
+每次完成推送都带会话 UUID 与轮询时间（poll_interval_sec）。
 
 会话控制（v0.4.0）：
 submit 支持 session_mode（auto/new/resume）+ session_id，
@@ -27,6 +32,10 @@ session_id 就是 Claude Code 原生会话 UUID（每个 Claude Code 会话唯�
 - resume 模式支持裸 UUID、唯一前缀、'claude --resume <uuid>' 命令形态，
   并自动从 ~/.claude/projects 存档解析会话归属目录（Claude CLI 按 cwd
   索引会话，目录不对 --resume 必然失败），可随时回到任意历史会话。
+
+v0.7.0 会话/轮询机制：UUID 为会话唯一标识；开新会话立即拿到 UUID（必与现有
+UUID 绝对不同，作为新/旧会话唯一判断标准）；活跃列表与 CC 进程一一对应、最多
+2 个；重启后列表清空不意外续跑；内置轮询安全网（默认 5 分钟可调）确保结果稳定送达。
 """
 
 from __future__ import annotations
@@ -100,6 +109,16 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
             # 3. 初始化会话管理器（使用基类的 self.store）
             self._session_mgr = SessionManager(self.store, logger=self.logger)
             await self._session_mgr.load()
+            # 重启/重载后会话列表必须为空：清除跨重启持久化的会话索引，
+            # 避免 auto 模式在用户不知情下静默续跑旧 Claude Code 会话。
+            # 历史会话仍可通过 session_mode='resume' + session_id=<UUID> 显式回到
+            # （直接读取 ~/.claude/projects 原生存档，不依赖此持久化索引）。
+            cleared = await self._session_mgr.clear()
+            if cleared:
+                self.logger.info(
+                    "Cleared {} persisted session(s) on startup (no surprise resume)",
+                    cleared,
+                )
 
             # 4. 初始化执行器
             self._executor = ClaudeCLIExecutor(self._config, logger=self.logger)
@@ -321,6 +340,7 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
                     lines.append(
                         f"会话 session_id={record.session_id}（后续可用 claude_code_followup 在同一会话追加指令）"
                     )
+                lines.append(f"轮询时间 poll_interval_sec={record.poll_interval_sec:.0f}s")
                 lines.append(f"任务指令：{prompt_brief}")
                 lines.append(f"执行结果：\n{output or '（无文本输出）'}")
             else:
@@ -331,6 +351,7 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
                     lines.append(
                         f"会话 session_id={record.session_id}（可用 claude_code_followup 在同一会话重试/纠正）"
                     )
+                lines.append(f"轮询时间 poll_interval_sec={record.poll_interval_sec:.0f}s")
                 lines.append(f"任务指令：{prompt_brief}")
                 lines.append(f"失败原因：{record.error_message or '未知错误'}")
             lines.append(
@@ -348,6 +369,7 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
                     "task_id": record.task_id,
                     "status": record.status.value,
                     "session_id": record.session_id,
+                    "poll_interval_sec": record.poll_interval_sec,
                     "elapsed_sec": round(elapsed, 1),
                 },
             )
@@ -383,8 +405,13 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
             "- effort: 推理努力级别（可选）：'low' / 'medium' / 'high'。\n"
             "- max_turns: 最大轮次（可选，0=使用默认值）。\n"
             "- session_mode: 'auto'（默认）/ 'new'（强制新会话）/ 'resume'（续跑指定会话）。\n"
-            "- session_id: 仅 session_mode='resume' 时需要。\n\n"
-            "返回：包含 task_id 和 status 的字典。"
+            "- session_id: 仅 session_mode='resume' 时需要。\n"
+            "- poll_interval_sec: 本任务轮询安全网间隔（秒，可选，默认 5 分钟=300）。\n"
+            "  按预期任务时长设置：短任务设短、长任务设长；不传用默认值。\n\n"
+            "返回：包含 task_id、status、session_id（Claude Code 会话 UUID）和 poll_interval_sec 的字典。\n"
+            "重要：新会话的 UUID 由 Claude CLI 启动后返回，本工具会短暂等待（通常 1-3s）\n"
+            "捕获后立即返回给你——拿到 session_id 即表示会话已建立，不要再重复开新会话。\n"
+            "resume 会话的 UUID 提交时已知，立即返回无需等待。"
         ),
         parameters={
             "type": "object",
@@ -426,10 +453,18 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
                         "或插件面板；支持完整 UUID、唯一前缀或 'claude --resume <uuid>' 命令形态。"
                     ),
                 },
+                "poll_interval_sec": {
+                    "type": "number",
+                    "description": (
+                        "本任务轮询安全网间隔（秒，可选）。默认 300（5 分钟）。"
+                        "按预期任务时长设置：短任务设短、长任务设长。"
+                        "也可事后用 claude_code_set_poll_interval 调整。"
+                    ),
+                },
             },
             "required": ["prompt"],
         },
-        timeout=10.0,
+        timeout=15.0,
     )
     async def claude_code_submit(
         self,
@@ -440,6 +475,7 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
         max_turns: int = 0,
         session_mode: str = "auto",
         session_id: str = "",
+        poll_interval_sec: float = 0.0,
         **_,
     ) -> dict[str, Any]:
         """提交 Claude Code 任务到后台异步执行。"""
@@ -486,15 +522,51 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
                 effort=effort,
                 max_turns=max_turns,
                 resume_session_id=resume_id,
+                poll_interval_sec=poll_interval_sec,
             )
+
+            # 解析会话 UUID：resume 会话提交时已知；新会话需等 CLI init 事件捕获
+            if resume_id:
+                session_uuid = resume_id
+            else:
+                session_uuid = await self._task_mgr.wait_session_id(
+                    record.task_id, timeout=8.0
+                )
+                # 唯一性校验：新会话 UUID 必须与当前所有可获取的 UUID 绝对不同
+                if session_uuid:
+                    assert self._task_mgr is not None
+                    collided = [
+                        r.task_id
+                        for r in self._task_mgr._tasks.values()
+                        if r.task_id != record.task_id and r.session_id == session_uuid
+                    ]
+                    if collided:
+                        await self._task_mgr.cancel(record.task_id)
+                        return Err(
+                            SdkError(
+                                f"新会话 UUID {session_uuid} 与现有会话冲突"
+                                f"（极罕见，task={collided}），已取消任务，请重试。"
+                            )
+                        )
+
             payload: dict[str, Any] = {
                 "task_id": record.task_id,
                 "status": record.status.value,
+                "session_id": session_uuid,
+                "poll_interval_sec": record.poll_interval_sec,
                 "resumed_session": resume_id,
                 "message": "任务已在后台开始执行（无超时限制）。请先回复用户「任务正在执行」，"
-                "不要原地等待；任务完成后插件会自动把结果推送给你。"
+                "不要原地等待；任务完成后插件会自动把结果推送给你（携带本会话 UUID 与轮询时间）。"
                 "想提前盯进度可反复调用 claude_code_wait（单次最多 55s，含实时进度）。",
             }
+            if not session_uuid:
+                # CLI 启动慢，init 事件尚未到达——猫娘可用 poll(task_id) 稍后取 UUID
+                payload["session_id"] = ""
+                payload["message"] = (
+                    "任务已提交，Claude Code 会话 UUID 正在建立中（CLI 启动稍慢）。"
+                    "请先回复用户「任务正在执行」，稍后用 claude_code_poll(task_id) 即可取到 session_id。"
+                    "任务完成后插件会自动推送结果。"
+                )
             if resume_title:
                 payload["resumed_session_title"] = resume_title
             return Ok(payload)
@@ -721,6 +793,13 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
                     "type": "integer",
                     "description": "最大轮次（可选，0=使用默认值）。",
                 },
+                "poll_interval_sec": {
+                    "type": "number",
+                    "description": (
+                        "本任务轮询安全网间隔（秒，可选，默认 5 分钟=300）。"
+                        "按预期任务时长设置：短任务设短、长任务设长。"
+                    ),
+                },
             },
             "required": ["instruction"],
         },
@@ -734,6 +813,7 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
         model: str = "",
         effort: str = "",
         max_turns: int = 0,
+        poll_interval_sec: float = 0.0,
         **_,
     ) -> dict[str, Any]:
         """在同一会话中追加补充/纠正指令。"""
@@ -822,11 +902,13 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
                 effort=effort,
                 max_turns=max_turns,
                 resume_session_id=target_sid,
+                poll_interval_sec=poll_interval_sec,
             )
             payload: dict[str, Any] = {
                 "task_id": new_record.task_id,
                 "status": new_record.status.value,
                 "session_id": target_sid,
+                "poll_interval_sec": new_record.poll_interval_sec,
                 "message": (
                     "追加指令已提交，将在同一会话中继续。"
                     "建议调用 claude_code_wait 等待执行结果。"
@@ -1017,46 +1099,225 @@ class ClaudeCodeAdapterPlugin(NekoPluginBase):
     @llm_tool(
         name="claude_code_clear_session",
         description=(
-            "清除 Claude Code 会话记录。\n\n"
-            "适用场景：\n"
-            "- 会话上下文混乱，想从干净状态开始\n"
-            "- 切换到不同的项目分支后清理旧上下文\n"
-            "- 会话报错后强制重置\n\n"
-            "参数：\n"
-            "- cwd: 要清除的工作目录（绝对路径）。留空则清除所有会话。\n\n"
-            "返回：包含 cleared_count 的字典。"
+            "清理 Claude Code 会话列表——取消活跃任务并杀掉对应 Claude Code 进程，"
+            "同时清空会话索引。\n\n"
+            "对应「清理会话列表 → Claude Code 同一会话进程关闭」。清理后释放的会话槽位"
+            "可让猫娘继续传同一 UUID 维持会话并再次进入任务列表。\n\n"
+            "参数（三选一，都不传则清理全部）：\n"
+            "- task_id: 只清理指定任务（取消并杀掉其 CC 进程，从列表释放）\n"
+            "- session_id: 只清理指定会话（按 UUID 定位活跃任务 + 清除索引）\n"
+            "- cwd: 只清理指定工作目录的会话索引\n\n"
+            "返回：包含 cleared_count、cancelled_active 的字典。"
         ),
         parameters={
             "type": "object",
             "properties": {
+                "task_id": {
+                    "type": "string",
+                    "description": "只清理指定任务（从 claude_code_submit/list_tasks 返回）。",
+                },
+                "session_id": {
+                    "type": "string",
+                    "description": "只清理指定会话（Claude Code 会话 UUID，支持前缀/命令形态）。",
+                },
                 "cwd": {
                     "type": "string",
-                    "description": "要清除的工作目录（绝对路径）。留空则清除所有会话。",
+                    "description": "只清理指定工作目录的会话索引（绝对路径）。",
                 },
             },
         },
-        timeout=10.0,
+        timeout=15.0,
     )
-    async def claude_code_clear_session(self, cwd: str = "", **_) -> dict[str, Any]:
-        """清除会话记录。"""
+    async def claude_code_clear_session(
+        self,
+        task_id: str = "",
+        session_id: str = "",
+        cwd: str = "",
+        **_,
+    ) -> dict[str, Any]:
+        """清理会话列表（取消活跃任务 + 杀 CC 进程 + 清空索引）。"""
         not_ready = self._ensure_ready()
         if not_ready is not None:
             return not_ready
 
         try:
             assert self._session_mgr is not None
-            target = cwd or None
-            count = await self._session_mgr.clear(target)
-            self.logger.info("Cleared {} session(s) (cwd={!r})", count, target)
+            assert self._task_mgr is not None
+
+            tid = (task_id or "").strip()
+            sid_ref = (session_id or "").strip()
+            target_cwd = (cwd or "").strip() or None
+
+            # 1) 按 task_id 定向清理
+            if tid:
+                res = await self._task_mgr.clear_one(tid)
+                if "error" in res:
+                    return Err(SdkError(res["error"]))
+                return Ok(
+                    {
+                        "cleared_count": 1,
+                        "cancelled_active": res.get("cancelled", False),
+                        "task_id": tid,
+                    }
+                )
+
+            # 2) 按 session_id 定向清理：先在活跃任务里找，找不到也清索引
+            if sid_ref:
+                ref = claude_sessions.normalize_session_ref(sid_ref)
+                matched_tid = ""
+                for r in list(self._task_mgr._tasks.values()):
+                    if r.session_id and r.session_id.lower() == ref.lower():
+                        matched_tid = r.task_id
+                        break
+                cancelled_active = 0
+                if matched_tid:
+                    res = await self._task_mgr.clear_one(matched_tid)
+                    cancelled_active = 1 if res.get("cancelled") else 0
+                # 同步清除该会话的持久化索引（若存在）
+                store_cleared = await self._session_mgr.clear(target_cwd)
+                return Ok(
+                    {
+                        "cleared_count": (1 if matched_tid else 0) + store_cleared,
+                        "cancelled_active": cancelled_active,
+                        "session_id": sid_ref,
+                    }
+                )
+
+            # 3) 按 cwd 清理：取消该 cwd 的活跃任务 + 清索引
+            if target_cwd:
+                import os as _os
+
+                norm = _os.path.normcase(_os.path.normpath(target_cwd))
+                tids = [
+                    r.task_id
+                    for r in list(self._task_mgr._tasks.values())
+                    if _os.normcase(_os.path.normpath(r.cwd)) == norm
+                ]
+                cancelled = 0
+                for t in tids:
+                    res = await self._task_mgr.clear_one(t)
+                    if res.get("cancelled"):
+                        cancelled += 1
+                store_cleared = await self._session_mgr.clear(target_cwd)
+                return Ok(
+                    {
+                        "cleared_count": cancelled + store_cleared,
+                        "cancelled_active": cancelled,
+                        "cwd": target_cwd,
+                    }
+                )
+
+            # 4) 全清：取消所有活跃任务（杀全部 CC 进程）+ 清空索引
+            res = await self._task_mgr.clear_all()
+            store_cleared = await self._session_mgr.clear()
+            self.logger.info(
+                "Cleared all sessions: active_cancelled={} store_cleared={}",
+                res.get("cancelled_active", 0),
+                store_cleared,
+            )
             return Ok(
                 {
-                    "cleared_count": count,
-                    "cwd": target or "(all)",
+                    "cleared_count": res.get("cleared_count", 0) + store_cleared,
+                    "cancelled_active": res.get("cancelled_active", 0),
+                    "scope": "all",
                 }
             )
         except Exception as e:
             self.logger.exception("claude_code_clear_session failed")
-            return Err(SdkError(f"清除会话失败: {e}"))
+            return Err(SdkError(f"清理会话失败: {e}"))
+
+    @llm_tool(
+        name="claude_code_list_tasks",
+        description=(
+            "列出当前活跃的 Claude Code 会话/任务列表（与正在执行的 Claude Code 进程一一对应）。\n\n"
+            "每个会话含 task_id、session_id（会话 UUID）、status、poll_interval_sec（轮询时间）、"
+            "已耗时、实时进度等。猫娘据此判断当前开了几个会话、是否需要清理或追加指令。\n\n"
+            "注意：已完成的任务会从列表自动释放（结果已推送给你）；想看历史会话用 "
+            "claude_code_list_sessions(include_history=true)。猫娘最多同时管理 2 个会话。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {},
+        },
+        timeout=10.0,
+    )
+    async def claude_code_list_tasks(self, **_) -> dict[str, Any]:
+        """列出活跃会话/任务（与 CC 进程一一对应）。"""
+        not_ready = self._ensure_ready()
+        if not_ready is not None:
+            return not_ready
+        if self._task_mgr is None:
+            return Err(SdkError("TaskManager not initialized"))
+        try:
+            tasks = self._task_mgr.list_active()
+            return Ok(
+                {
+                    "count": len(tasks),
+                    "max_concurrent": self._task_mgr._max_concurrent,
+                    "default_poll_interval_sec": self._task_mgr._default_poll_interval,
+                    "tasks": tasks,
+                }
+            )
+        except Exception as e:
+            self.logger.exception("claude_code_list_tasks failed")
+            return Err(SdkError(f"列出任务失败: {e}"))
+
+    @llm_tool(
+        name="claude_code_set_poll_interval",
+        description=(
+            "调整 Claude Code 任务的轮询安全网间隔（默认 5 分钟=300 秒）。\n\n"
+            "用途：按预期任务完成时间合理设置轮询时间——短任务设短、长任务设长。\n"
+            "可在提交时传 poll_interval_sec 单次覆盖，也可用本工具事后调整默认值或单个任务。\n\n"
+            "参数：\n"
+            "- interval_sec: 要设置的单任务轮询间隔（秒）。需配合 task_id 使用。\n"
+            "- default: 要设置的默认轮询间隔（秒），影响后续新任务。\n"
+            "- task_id: 仅调整该任务的轮询间隔（运行中也即时生效）。\n\n"
+            "返回：更新后的默认/单任务轮询间隔。"
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "interval_sec": {
+                    "type": "number",
+                    "description": "单任务轮询间隔（秒），配合 task_id 使用。",
+                },
+                "default": {
+                    "type": "number",
+                    "description": "默认轮询间隔（秒），影响后续新任务。",
+                },
+                "task_id": {
+                    "type": "string",
+                    "description": "仅调整该任务的轮询间隔（可选）。",
+                },
+            },
+        },
+        timeout=5.0,
+    )
+    async def claude_code_set_poll_interval(
+        self,
+        interval_sec: float = 0.0,
+        default: float = 0.0,
+        task_id: str = "",
+        **_,
+    ) -> dict[str, Any]:
+        """调整轮询安全网间隔（默认/单任务）。"""
+        not_ready = self._ensure_ready()
+        if not_ready is not None:
+            return not_ready
+        if self._task_mgr is None:
+            return Err(SdkError("TaskManager not initialized"))
+        try:
+            res = self._task_mgr.set_poll_interval(
+                task_id=task_id.strip(),
+                interval_sec=interval_sec,
+                default=default,
+            )
+            if "error" in res:
+                return Err(SdkError(res["error"]))
+            return Ok(res)
+        except Exception as e:
+            self.logger.exception("claude_code_set_poll_interval failed")
+            return Err(SdkError(f"调整轮询间隔失败: {e}"))
 
     @llm_tool(
         name="claude_code_get_config",
